@@ -134,62 +134,110 @@ def overlay_heatmap_on_frame(
 
 
 # ── get_region_label ──────────────────────────────────────────────────────────
+#
+# Face region map (proportional, maps to 224×224 reference):
+#   Row bands  (as fraction of map height):
+#     0.000–0.268  → "forehead / upper face"     (rows   0– 60 of 224)
+#     0.268–0.491  → "eye / brow region"          (rows  60–110 of 224)
+#     0.491–0.670  → "nose / mid-face"            (rows 110–150 of 224)
+#     0.670–0.804  → "mouth / philtrum"           (rows 150–180 of 224)
+#     0.804–1.000  → "chin / jaw"                 (rows 180–224 of 224)
+#
+#   Col bands  (as fraction of map width):
+#     0.000–0.268  → "left side"                  (cols   0– 60 of 224)
+#     0.268–0.714  → "central"                    (cols  60–160 of 224)
+#     0.714–1.000  → "right side"                 (cols 160–224 of 224)
 
-_REGION_LABELS = {
-    ("upper",  "left"):   "upper-left periocular region",
-    ("upper",  "center"): "upper-central forehead and brow region",
-    ("upper",  "right"):  "upper-right periocular region",
-    ("middle", "left"):   "left cheek and ear region",
-    ("middle", "center"): "central nasal and mid-face region",
-    ("middle", "right"):  "right cheek and ear region",
-    ("lower",  "left"):   "lower-left jaw and mouth region",
-    ("lower",  "center"): "lower-central mouth and chin region",
-    ("lower",  "right"):  "lower-right jaw and mouth region",
-}
+_ROW_BANDS = [
+    (0.000, 0.268, "forehead / upper face"),
+    (0.268, 0.491, "eye / brow region"),
+    (0.491, 0.670, "nose / mid-face"),
+    (0.670, 0.804, "mouth / philtrum"),
+    (0.804, 1.001, "chin / jaw"),
+]
+
+_COL_BANDS = [
+    (0.000, 0.268, "left"),
+    (0.268, 0.714, "central"),
+    (0.714, 1.001, "right"),
+]
 
 
 def get_region_label(attn_map: np.ndarray) -> str:
     """
-    Return a human-readable 9-region label for the peak of the attention map.
+    Return a human-readable face-region label for the peak of the attention map.
 
-    Partitions the map into a 3×3 grid:
-      rows 0-1=upper, 2-4=middle, 5-6=lower
-      cols 0-1=left,  2-4=center, 5-6=right
+    Uses a 5-row × 3-column proportional grid calibrated to a 224×224 face crop:
+      rows: forehead/upper-face · eye/brow · nose/mid-face · mouth/philtrum · chin/jaw
+      cols: left · central · right
 
-    Appends "(peak at row=r, col=c)" for verifiability.
+    Appends "(peak at row=R, col=C)" for verifiability.
 
     Parameters
     ----------
-    attn_map : 2D numpy float array (any spatial size, but designed for 7×7)
+    attn_map : 2D numpy float array (any spatial size)
 
     Returns
     -------
-    str  e.g. "central nasal and mid-face region (peak at row=3, col=3)"
+    str  e.g. "central nose / mid-face region (peak at row=80, col=140)"
     """
     peak_idx = int(np.argmax(attn_map))
     r, c = np.unravel_index(peak_idx, attn_map.shape)
     H, W = attn_map.shape
 
-    # Row bucket: upper=rows 0-1, middle=rows 2-4, lower=rows 5-6 (for 7-row map)
     row_frac = r / max(H - 1, 1)
-    if row_frac < 2 / 6:
-        row_key = "upper"
-    elif row_frac <= 4 / 6:
-        row_key = "middle"
-    else:
-        row_key = "lower"
-
-    # Col bucket: left=cols 0-1, center=cols 2-4, right=cols 5-6 (for 7-col map)
     col_frac = c / max(W - 1, 1)
-    if col_frac < 2 / 6:
-        col_key = "left"
-    elif col_frac <= 4 / 6:
-        col_key = "center"
-    else:
-        col_key = "right"
 
-    label = _REGION_LABELS.get((row_key, col_key), "central nasal and mid-face region")
-    return f"{label} (peak at row={r}, col={c})"
+    row_label = "nose / mid-face"   # sensible fallback
+    for lo, hi, label in _ROW_BANDS:
+        if lo <= row_frac < hi:
+            row_label = label
+            break
+
+    col_label = "central"
+    for lo, hi, label in _COL_BANDS:
+        if lo <= col_frac < hi:
+            col_label = label
+            break
+
+    return f"{col_label} {row_label} region (peak at row={r}, col={c})"
+
+
+# ── Manipulation-aware artifact bullets ───────────────────────────────────────
+
+_MANIPULATION_ARTIFACTS = {
+    "Deepfakes":       [
+        "Face-swap blending boundaries, identity blend seams",
+        "Identity inconsistency between source and target",
+        "GAN frequency fingerprints in shallow texture layers",
+    ],
+    "Face2Face":       [
+        "Expression-source mismatch, unnatural jaw / mouth motion",
+        "Reenactment boundary misalignment around mouth corners",
+        "Temporal expression discontinuity between frames",
+    ],
+    "FaceSwap":        [
+        "Landmark-driven warp seams along jaw and hairline",
+        "Geometric distortion at face boundary",
+        "Texture discontinuity where warped region meets background",
+    ],
+    "FaceShifter":     [
+        "Identity-preserving blending residue, attribute swap artifacts",
+        "Subtle colour mismatch between swapped and original skin tones",
+        "High-frequency edge ghosting at occlusion boundaries",
+    ],
+    "NeuralTextures":  [
+        "Mouth-region neural rendering residue, lip-sync mismatch",
+        "Texture hallucination artefacts in the lip / teeth area",
+        "Temporal flickering of synthesised mouth pixels",
+    ],
+}
+
+_DEFAULT_ARTIFACTS = [
+    "Blending boundary artifacts at face-swap seams",
+    "Unnatural skin texture or colour inconsistencies",
+    "Identity inconsistencies introduced by face manipulation",
+]
 
 
 # ── generate_explanation_text ─────────────────────────────────────────────────
@@ -201,6 +249,7 @@ def generate_explanation_text(
     attention_scores: list,
     attention_maps: list,
     batch_inter_sample_sim: float = 0.0,
+    active_manipulation: str = "",
 ) -> str:
     """
     Build a multi-line plain-English explanation string.
@@ -213,6 +262,8 @@ def generate_explanation_text(
     attention_scores        : list of T floats — per-frame scalar attention values
     attention_maps          : list of T 2-D numpy arrays
     batch_inter_sample_sim  : mean cosine sim across the evaluation batch (for collapse check)
+    active_manipulation     : EAHNConfig.active_manipulation string (e.g. "Face2Face");
+                              controls the manipulation-specific artifact bullets.
 
     Returns
     -------
@@ -278,11 +329,11 @@ def generate_explanation_text(
     lines.append(f"  • The primary area of concern is the {region}.")
 
     if verdict == "FAKE":
+        # Manipulation-aware artifact bullets (Task 1.2)
+        artifacts = _MANIPULATION_ARTIFACTS.get(active_manipulation, _DEFAULT_ARTIFACTS)
         lines.append("  • High attention in this area may indicate:")
-        lines.append("      - Blending boundary artifacts at face-swap seams")
-        lines.append("      - Unnatural skin texture or colour inconsistencies")
-        lines.append("      - Identity inconsistencies introduced by face-swap methods")
-        lines.append("      - GAN frequency fingerprints in shallow texture layers")
+        for art in artifacts:
+            lines.append(f"      - {art}")
     else:
         lines.append("  • No strong manipulation artifacts were detected.")
         lines.append(
@@ -294,7 +345,8 @@ def generate_explanation_text(
     for i, score in enumerate(attention_scores):
         filled = int(score * 20)
         bar    = "█" * filled + "░" * (20 - filled)
-        lines.append(f"  Frame {i + 1:02d}: [{bar}]  {score:.3f}")
+        # Task 1.3: 4 decimal places for verifiability (was .3f → .4f)
+        lines.append(f"  Frame {i + 1:02d}: [{bar}]  {score:.4f}")
 
     return "\n".join(lines)
 
@@ -310,19 +362,21 @@ def save_annotated_frame_strip(
     output_path: str,
     sample_id: str,
     batch_inter_sample_sim: float = 0.0,
+    active_manipulation: str = "",
 ) -> str:
     """
     Save a horizontal strip of up to 8 annotated frames plus a text panel.
 
     Parameters
     ----------
-    frames_bgr       : list of T  H×W×3 uint8 BGR arrays
-    attention_maps   : list of T  2-D float arrays
-    attention_scores : list of T  floats
-    verdict          : "FAKE" or "REAL"
-    prob             : raw sigmoid probability
-    output_path      : destination .png path
-    sample_id        : string identifier used in labels
+    frames_bgr          : list of T  H×W×3 uint8 BGR arrays
+    attention_maps      : list of T  2-D float arrays
+    attention_scores    : list of T  floats
+    verdict             : "FAKE" or "REAL"
+    prob                : raw sigmoid probability
+    output_path         : destination .png path
+    sample_id           : string identifier used in labels
+    active_manipulation : EAHNConfig.active_manipulation (e.g. "Face2Face")
 
     Returns
     -------
@@ -387,6 +441,7 @@ def save_annotated_frame_strip(
     text       = generate_explanation_text(
         verdict, confidence, prob, attention_scores, attention_maps,
         batch_inter_sample_sim=batch_inter_sample_sim,
+        active_manipulation=active_manipulation,
     )
     # Append concentration stats line
     text += (

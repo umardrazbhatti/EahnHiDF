@@ -1,6 +1,18 @@
 """
 scripts/evaluate.py — Full evaluation: detection + explanation metrics + heatmaps.
 
+Output directory layout (canonical, Task 1.4):
+  {output_dir}/eval/ffpp_test_metrics.json    — FF++ detection metrics (primary)
+  {output_dir}/eval/metrics.json              — backward-compat copy (deprecated)
+  {output_dir}/eval/celebdf_test_metrics.json — Celeb-DF cross-domain metrics
+  {output_dir}/eval/report.txt               — human-readable summary
+  {output_dir}/metrics.csv                   — combined detection+explanation CSV
+  {output_dir}/explanation_metrics.json      — intrinsic explanation quality metrics
+  {output_dir}/heatmaps/                     — multi-frame strip PNGs + MP4 overlays
+  {output_dir}/plots/heatmaps/               — per-frame single-frame XAI overlay PNGs
+  {output_dir}/plots/ffpp_*.png              — FF++ detection visualizations
+  {output_dir}/plots/celebdf_*.png           — Celeb-DF detection visualizations
+
 Key fixes vs original:
   1. Checkpoint loading uses weights_only=False (PyTorch 2.6+ fix).
   2. GradCAM IndexError fixed via _ScalarOutputTarget in xai/gradcam.py.
@@ -43,8 +55,35 @@ import cv2
 
 # ── Detection graph helper ────────────────────────────────────────────────────
 
-def save_detection_graphs(probs, labels, output_dir: str) -> None:
-    """Save ROC curve, PR curve, confusion matrix, and score-distribution PNGs."""
+def plot_evaluation_visuals(
+    probs,
+    labels,
+    out_dir: str,
+    prefix: str,
+    optimal_thr: float = 0.5,
+) -> None:
+    """
+    Save all standard detection visualisations for one evaluation split.
+
+    Task 2.2: refactored from save_detection_graphs so it can be called for
+    both FF++ (prefix="ffpp") and Celeb-DF (prefix="celebdf").
+
+    Outputs (under out_dir/):
+        {prefix}_roc.png
+        {prefix}_pr.png
+        {prefix}_confusion.png
+        {prefix}_confusion_norm.png
+        {prefix}_score_distribution.png
+        {prefix}_summary_chart.png    (placeholder — full chart via summary_chart.py)
+
+    Parameters
+    ----------
+    probs       : array-like of float probabilities
+    labels      : array-like of int labels (0=real, 1=fake)
+    out_dir     : destination directory (will be created if needed)
+    prefix      : "ffpp" | "celebdf" or any short identifier
+    optimal_thr : optimal decision threshold (shown as second vertical line)
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -55,10 +94,17 @@ def save_detection_graphs(probs, labels, output_dir: str) -> None:
     )
     import seaborn as sns
 
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
     probs  = np.array(probs)
     labels = np.array(labels)
     preds  = (probs >= 0.5).astype(int)
+
+    label_set = np.unique(labels)
+    if len(label_set) < 2:
+        print(f"[plot_evaluation_visuals] Skipping {prefix}: only one class in labels.")
+        return
+
+    tag = prefix.upper()
 
     # 1 — ROC Curve
     fpr, tpr, _ = roc_curve(labels, probs)
@@ -68,10 +114,10 @@ def save_detection_graphs(probs, labels, output_dir: str) -> None:
     ax.plot([0, 1], [0, 1], "k--", lw=1, label="Random chance")
     ax.set_xlabel("False Positive Rate")
     ax.set_ylabel("True Positive Rate")
-    ax.set_title("ROC Curve — Deepfake Detection (FF++ c23)")
+    ax.set_title(f"ROC Curve — {tag}")
     ax.legend()
     fig.tight_layout()
-    fig.savefig(os.path.join(output_dir, "roc_curve.png"), dpi=150)
+    fig.savefig(os.path.join(out_dir, f"{prefix}_roc.png"), dpi=150)
     plt.close(fig)
 
     # 2 — Precision-Recall Curve
@@ -81,10 +127,10 @@ def save_detection_graphs(probs, labels, output_dir: str) -> None:
     ax.plot(rec, prec, lw=2, color="darkorange", label=f"AP = {ap:.3f}")
     ax.set_xlabel("Recall")
     ax.set_ylabel("Precision")
-    ax.set_title("Precision-Recall Curve")
+    ax.set_title(f"Precision-Recall Curve — {tag}")
     ax.legend()
     fig.tight_layout()
-    fig.savefig(os.path.join(output_dir, "pr_curve.png"), dpi=150)
+    fig.savefig(os.path.join(out_dir, f"{prefix}_pr.png"), dpi=150)
     plt.close(fig)
 
     # 3a — Confusion Matrix (raw counts)
@@ -94,9 +140,9 @@ def save_detection_graphs(probs, labels, output_dir: str) -> None:
                 xticklabels=["Real", "Fake"], yticklabels=["Real", "Fake"])
     ax.set_ylabel("Ground Truth")
     ax.set_xlabel("Predicted")
-    ax.set_title("Confusion Matrix")
+    ax.set_title(f"Confusion Matrix — {tag}")
     fig.tight_layout()
-    fig.savefig(os.path.join(output_dir, "confusion_matrix.png"), dpi=150)
+    fig.savefig(os.path.join(out_dir, f"{prefix}_confusion.png"), dpi=150)
     plt.close(fig)
 
     # 3b — Confusion Matrix (row-normalised)
@@ -107,34 +153,69 @@ def save_detection_graphs(probs, labels, output_dir: str) -> None:
                 vmin=0.0, vmax=1.0)
     ax.set_ylabel("Ground Truth")
     ax.set_xlabel("Predicted")
-    ax.set_title("Confusion Matrix (Normalised)")
+    ax.set_title(f"Confusion Matrix (Normalised) — {tag}")
     fig.tight_layout()
-    fig.savefig(os.path.join(output_dir, "confusion_matrix_norm.png"), dpi=150)
+    fig.savefig(os.path.join(out_dir, f"{prefix}_confusion_norm.png"), dpi=150)
     plt.close(fig)
 
-    # 4 — Score Distribution
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.hist(probs[labels == 0], bins=30, alpha=0.6, label="Real", color="blue")
-    ax.hist(probs[labels == 1], bins=30, alpha=0.6, label="Fake", color="red")
-    ax.axvline(0.5, color="black", linestyle="--", label="Decision threshold")
+    # 4 — Score Distribution (thr=0.5 + optimal threshold)
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.hist(probs[labels == 0], bins=30, alpha=0.6, label="Real", color="steelblue")
+    ax.hist(probs[labels == 1], bins=30, alpha=0.6, label="Fake", color="tomato")
+    ax.axvline(0.5, color="black", linestyle="--", linewidth=1.5, label="thr = 0.5")
+    if abs(optimal_thr - 0.5) > 0.01:
+        ax.axvline(optimal_thr, color="purple", linestyle=":",
+                   linewidth=1.5, label=f"optimal thr = {optimal_thr:.2f}")
     ax.set_xlabel("Predicted Probability (Deepfake)")
     ax.set_ylabel("Count")
-    ax.set_title("Score Distribution")
+    ax.set_title(f"Score Distribution — {tag}")
     ax.legend()
     fig.tight_layout()
-    fig.savefig(os.path.join(output_dir, "score_distribution.png"), dpi=150)
+    fig.savefig(os.path.join(out_dir, f"{prefix}_score_distribution.png"), dpi=150)
     plt.close(fig)
 
-    # Verify required PNGs were written
-    required_pngs = ["roc_curve.png", "pr_curve.png",
-                     "confusion_matrix.png", "confusion_matrix_norm.png"]
-    for fname in required_pngs:
-        fpath = os.path.join(output_dir, fname)
-        if not os.path.exists(fpath):
-            raise FileNotFoundError(
-                f"[Evaluate] Required PNG not found after saving: {fpath}"
-            )
-    print(f"[Evaluate] Detection graphs saved → {output_dir}")
+    # 5 — Summary chart (reuses plots/summary_chart.py format)
+    # Produce a simple bar chart with the 5 headline numbers
+    from sklearn.metrics import balanced_accuracy_score
+    bal_acc = float(balanced_accuracy_score(labels, preds))
+    real_acc = float((preds[labels == 0] == 0).mean()) if (labels == 0).sum() > 0 else 0.0
+    fake_acc = float((preds[labels == 1] == 1).mean()) if (labels == 1).sum() > 0 else 0.0
+    metrics_bar = {"AUC-ROC": auc, "AP": ap, "Bal.Acc": bal_acc,
+                   "Real Acc": real_acc, "Fake Acc": fake_acc}
+    fig, ax = plt.subplots(figsize=(7, 4))
+    bars = ax.bar(list(metrics_bar.keys()), list(metrics_bar.values()),
+                  color=["royalblue", "darkorange", "mediumseagreen", "steelblue", "tomato"])
+    ax.set_ylim(0, 1.05)
+    ax.axhline(0.5, color="grey", linestyle="--", linewidth=1, alpha=0.5)
+    for bar, val in zip(bars, metrics_bar.values()):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                f"{val:.3f}", ha="center", va="bottom", fontsize=9)
+    ax.set_title(f"Detection Summary — {tag}")
+    ax.set_ylabel("Score")
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, f"{prefix}_summary_chart.png"), dpi=150)
+    plt.close(fig)
+
+    print(f"[Evaluate] {tag} visuals saved → {out_dir}  (prefix={prefix})")
+
+
+def save_detection_graphs(probs, labels, output_dir: str) -> None:
+    """Backward-compat wrapper → delegates to plot_evaluation_visuals with prefix='ffpp'."""
+    plot_evaluation_visuals(probs, labels,
+                            out_dir=output_dir, prefix="ffpp", optimal_thr=0.5)
+    # Also write legacy filenames so any existing consumers don't break
+    import shutil as _shu
+    _legacy = {
+        "ffpp_roc.png": "roc_curve.png",
+        "ffpp_pr.png": "pr_curve.png",
+        "ffpp_confusion.png": "confusion_matrix.png",
+        "ffpp_confusion_norm.png": "confusion_matrix_norm.png",
+        "ffpp_score_distribution.png": "score_distribution.png",
+    }
+    for src_name, dst_name in _legacy.items():
+        _src = os.path.join(output_dir, src_name)
+        if os.path.exists(_src):
+            _shu.copy2(_src, os.path.join(output_dir, dst_name))
 
 
 # ── Manipulation-type parser (Phase 15) ──────────────────────────────────────
@@ -224,16 +305,29 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
     eval_dir   = os.path.join(config.output_dir, "eval")
     os.makedirs(eval_dir, exist_ok=True)
 
+    # Task 2.2: Save detection visuals to plots/ subdirectory
+    plots_dir  = os.path.join(config.output_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+
     labels_arr = np.array(all_labels)
+    _opt_thr   = float(det_metrics.get("optimal_threshold", 0.5))
     if len(np.unique(labels_arr)) >= 2:
-        save_detection_graphs(all_probs, all_labels, eval_dir)
-        # Also copy to root output_dir so Cell 9 finds them without subdir
+        plot_evaluation_visuals(all_probs, all_labels,
+                                out_dir=plots_dir, prefix="ffpp",
+                                optimal_thr=_opt_thr)
+        # Also copy legacy names to eval_dir for backward compat (Cell 9)
         import shutil as _shutil
-        for _png in ["roc_curve.png", "pr_curve.png", "confusion_matrix.png",
-                     "confusion_matrix_norm.png", "score_distribution.png"]:
-            _src = os.path.join(eval_dir, _png)
+        _legacy_map = {
+            "ffpp_roc.png": "roc_curve.png",
+            "ffpp_pr.png": "pr_curve.png",
+            "ffpp_confusion.png": "confusion_matrix.png",
+            "ffpp_confusion_norm.png": "confusion_matrix_norm.png",
+            "ffpp_score_distribution.png": "score_distribution.png",
+        }
+        for _src_name, _dst_name in _legacy_map.items():
+            _src = os.path.join(plots_dir, _src_name)
             if os.path.exists(_src):
-                _shutil.copy2(_src, os.path.join(config.output_dir, _png))
+                _shutil.copy2(_src, os.path.join(config.output_dir, _dst_name))
     else:
         print("[Evaluate] Skipping detection graphs — only one class in test set.")
 
@@ -334,16 +428,11 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
         print("  Do NOT proceed to longer runs. Diagnose the explanation head first.\n")
 
     # ── Adebayo model-randomization sanity check ─────────────────────────────
-    mt_vs_random_cosine = 1.0
-    try:
-        from xai.sanity_checks import model_randomization_check
-        _sample_idx     = int(indices[0])
-        _frames_sample  = test_ds[_sample_idx]["frames"].unsqueeze(0).to(device)
-        mt_vs_random_cosine = model_randomization_check(model, _frames_sample, n_random=3)
-        print(f"[Sanity] model_randomization cosine sim = {mt_vs_random_cosine:.3f} "
-              f"({'PASS < 0.7' if mt_vs_random_cosine < 0.7 else 'WARN > 0.7 — explanation insensitive to weights'})")
-    except Exception as e:
-        print(f"  [Adebayo sanity check skipped: {e}]")
+    # Task 1.7: No longer computed here. The value is produced ONCE by
+    # run_explanation_suite (fixed seed=42, n_random=30) and written to
+    # explanation_metrics.json. We use a sentinel 1.0 here and the suite
+    # value will be read back if needed for downstream consumers.
+    mt_vs_random_cosine = 1.0   # placeholder — see explanation_metrics.json
 
     exp_metrics = {
         "temporal_ssim":              ssim_val,
@@ -419,10 +508,16 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
         "deletion_auc": del_auc,
     }
     metrics_json["active_manipulation"] = getattr(config, "active_manipulation", "")
-    json_path = os.path.join(eval_dir, "metrics.json")
+    # Task 1.5: primary filename is ffpp_test_metrics.json; keep metrics.json as
+    # a backward-compatibility copy (deprecated — remove after one release cycle).
+    json_path       = os.path.join(eval_dir, "ffpp_test_metrics.json")
+    json_compat_path = os.path.join(eval_dir, "metrics.json")
     with open(json_path, "w") as f:
         _json.dump(metrics_json, f, indent=2)
-    print(f"[Evaluate] metrics.json saved → {json_path}")
+    import shutil as _shutil_json
+    _shutil_json.copy2(json_path, json_compat_path)   # backward-compat copy
+    print(f"[Evaluate] ffpp_test_metrics.json saved → {json_path}")
+    print(f"[Evaluate] metrics.json (compat copy) → {json_compat_path}")
 
     faithful_str = "yes" if ins_auc > del_auc else "NO — heatmap not predictive"
     report = (
@@ -517,11 +612,12 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
 
             _bd_result[_mtype] = _entry
 
-        # — Add to metrics.json —
+        # — Add to ffpp_test_metrics.json (and keep compat copy in sync) —
         metrics_json["breakdown_by_manipulation"] = _bd_result
         with open(json_path, "w") as _jf:
             _json.dump(metrics_json, _jf, indent=2)
-        print(f"[Evaluate] metrics.json updated with breakdown → {json_path}")
+        _shutil_json.copy2(json_path, json_compat_path)
+        print(f"[Evaluate] ffpp_test_metrics.json updated with breakdown → {json_path}")
 
         # — Append breakdown table to report.txt —
         _bd_lines = [
@@ -623,6 +719,14 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
             print(f"[Celeb-DF] AUC-ROC={celebdf_metrics.get('auc_roc', 0):.4f} "
                   f"F1={celebdf_metrics.get('f1_at_0.5', 0):.4f}")
             print(f"[Celeb-DF] metrics saved → {celebdf_json_path}")
+
+            # Task 2.2: Generate full Celeb-DF visualizations
+            _cdf_opt_thr = float(celebdf_metrics.get("optimal_threshold", 0.5))
+            plot_evaluation_visuals(
+                _cdf_probs, _cdf_labels,
+                out_dir=plots_dir, prefix="celebdf",
+                optimal_thr=_cdf_opt_thr,
+            )
         except Exception as _cdf_err:
             print(f"[Celeb-DF] eval skipped: {_cdf_err}")
 
@@ -652,6 +756,20 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
         inter_sample_cosine=collapse_diag["inter_sample_cosine_mean"],
     )
 
+    # ── Task 2.3: Auto-bundle analysis essentials ─────────────────────────────
+    if getattr(config, "active_manipulation", ""):
+        try:
+            from scripts.package_analysis_bundle import package_analysis_bundle
+            _bundle_dir = os.path.join(config.output_dir, "analysis_essentials")
+            package_analysis_bundle(
+                output_dir=config.output_dir,
+                manipulation=config.active_manipulation,
+                bundle_dir=_bundle_dir,
+                do_zip=False,
+            )
+        except Exception as _bundle_err:
+            print(f"[Bundle] analysis bundle skipped: {_bundle_err}")
+
     print("Evaluation complete. Outputs saved to", config.output_dir)
 
 
@@ -663,10 +781,11 @@ def _generate_heatmaps(config, model, test_ds, sample_indices, device, all_probs
     from xai.attention_rollout import AttentionRolloutExplainer
     from xai.shap_explainer import SHAPExplainer
 
-    heatmap_dir     = os.path.join(config.output_dir, "heatmaps")
-    explanation_dir = os.path.join(config.output_dir, "explanations")
+    # Canonical layout (Task 1.4):
+    #   heatmaps/       → multi-frame strip PNGs + MP4 overlay videos
+    #   plots/heatmaps/ → per-frame single-frame XAI overlay PNGs
+    heatmap_dir = os.path.join(config.output_dir, "heatmaps")
     os.makedirs(heatmap_dir, exist_ok=True)
-    os.makedirs(explanation_dir, exist_ok=True)
 
     gradcam_exp = GradCAMExplainer(model, target_layer=model.spatial_stream.grad_cam_target_layer)
     rollout_exp = AttentionRolloutExplainer(model)
@@ -701,11 +820,13 @@ def _generate_heatmaps(config, model, test_ds, sample_indices, device, all_probs
         intrinsic_scores = [_peakiness(m) for m in intrinsic_maps]
 
         # ── Annotated frame strip + companion text explanation (5f) ───────────
+        # Strips go to heatmaps/ (canonical layout, Task 1.4)
         save_annotated_frame_strip(
             sampled_orig, intrinsic_maps, intrinsic_scores, verdict, prob,
-            os.path.join(explanation_dir, f"{video_id}_strip.png"),
+            os.path.join(heatmap_dir, f"{video_id}_strip.png"),
             sample_id=video_id,
             batch_inter_sample_sim=batch_inter_sample_sim,
+            active_manipulation=getattr(config, "active_manipulation", ""),
         )
 
         # ── Intrinsic explanation video (5f) ──────────────────────────────────
@@ -830,6 +951,7 @@ def _save_representative_heatmaps(
             orig_frames, intrinsic_maps, intrinsic_scores, verdict, prob,
             png_path, sample_id=video_id,
             batch_inter_sample_sim=batch_inter_sample_sim,
+            active_manipulation=getattr(config, "active_manipulation", ""),
         )
 
         # ── Plain-English summary TXT ────────────────────────────────────

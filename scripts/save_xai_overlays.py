@@ -26,6 +26,23 @@ from tqdm import tqdm
 from utils.visualization import overlay_heatmap_on_frame
 
 
+def _ensure_uint8_bgr(img) -> np.ndarray:
+    """
+    Guarantee img is a uint8 numpy array with shape (H, W, 3) in BGR channel order.
+    Handles: torch.Tensor (C,H,W or H,W,C), float arrays [0..1], and already-uint8 BGR.
+    """
+    if isinstance(img, torch.Tensor):
+        img = img.detach().cpu().numpy()
+    img = np.asarray(img)
+    # CHW → HWC
+    if img.ndim == 3 and img.shape[0] in (1, 3) and img.shape[0] < img.shape[1]:
+        img = img.transpose(1, 2, 0)
+    # Float [0,1] → uint8
+    if img.dtype != np.uint8:
+        img = (img.clip(0.0, 1.0) * 255.0).astype(np.uint8)
+    return img
+
+
 def _select_samples(probs, labels, n_high=2, n_mid=2, n_low=1):
     """
     Select n_high + n_mid + n_low indices per class.
@@ -193,15 +210,19 @@ def save_xai_overlays(model, test_loader, config, output_dir: Path):
             ]:
                 heatmap = maps[fi]   # (H, W)
 
-                # overlay_heatmap_on_frame expects BGR frame + heatmap (H,W) float [0,1]
-                bgr_frame = rgb_frame[:, :, ::-1].copy()
-                overlay   = overlay_heatmap_on_frame(bgr_frame, heatmap)   # BGR
+                # overlay_heatmap_on_frame returns (overlay_bgr, attn_norm) tuple
+                bgr_frame        = rgb_frame[:, :, ::-1].copy()
+                overlay_bgr, _   = overlay_heatmap_on_frame(bgr_frame, heatmap)
+                overlay_bgr      = _ensure_uint8_bgr(overlay_bgr)   # safety guard
 
                 fname    = f"{video_id}_{label_str}_conf{prob:.2f}_{method_name}_f{fi}.png"
                 out_path = output_dir / fname
 
                 import cv2 as _cv2
-                _cv2.imwrite(str(out_path), overlay)
+                ok = _cv2.imwrite(str(out_path), overlay_bgr)
+                if not ok:
+                    print(f"[WARN] imwrite failed for {out_path}; "
+                          f"shape={overlay_bgr.shape}, dtype={overlay_bgr.dtype}")
 
         print(f"[XAI overlay] saved {video_id} ({label_str}, prob={prob:.2f})")
 

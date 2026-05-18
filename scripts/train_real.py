@@ -173,6 +173,18 @@ def main(config: EAHNConfig):
         "val_inter_sample_cos": [], "val_mt_std":           [],
     }
 
+    # ── Task 3.3: early stopping state ────────────────────────────────────────
+    _es_patience  = int(getattr(config, "early_stop_patience",  5))
+    _es_min_delta = float(getattr(config, "early_stop_min_delta", 0.001))
+    _es_metric    = str(getattr(config, "early_stop_metric", "val_balanced_accuracy"))
+    _es_best      = -float("inf")
+    _es_wait      = 0
+    _es_triggered = False
+    print(
+        f"[EarlyStopping] metric={_es_metric}  patience={_es_patience}  "
+        f"min_delta={_es_min_delta}"
+    )
+
     # CHANGE 6 (phase7): build a parallel "clean" loader using the val
     # transform (no augmentation) but the train sample list. If the model
     # later reports high train accuracy on the augmented loader but low
@@ -395,8 +407,45 @@ def main(config: EAHNConfig):
             print(f"[Checkpoint] last_checkpoint.pth saved  "
                   f"(epoch={epoch}, best_metric={best_metric:.4f})")
 
+        # ── Task 3.3: early stopping check ────────────────────────────────────
+        # Metric key mapping (history dict uses abbreviated keys)
+        _es_metric_map = {
+            "val_balanced_accuracy": "val_balanced_acc",
+            "val_balanced_acc":      "val_balanced_acc",
+            "val_auc_roc":           "val_auc_roc",
+            "val_fake_accuracy":     "val_fake_acc",
+            "val_fake_acc":          "val_fake_acc",
+        }
+        _es_key = _es_metric_map.get(_es_metric, "val_balanced_acc")
+        _es_cur = history[_es_key][-1] if history[_es_key] else float("nan")
+
+        if np.isfinite(_es_cur):
+            if _es_cur > _es_best + _es_min_delta:
+                _es_best = _es_cur
+                _es_wait = 0
+                print(f"[EarlyStopping] Improvement → {_es_key}={_es_cur:.4f} (best={_es_best:.4f})")
+            else:
+                _es_wait += 1
+                print(
+                    f"[EarlyStopping] No improvement for {_es_wait}/{_es_patience} epochs "
+                    f"({_es_key}={_es_cur:.4f} ≤ best+delta={_es_best + _es_min_delta:.4f})"
+                )
+                if _es_wait >= _es_patience:
+                    print(
+                        f"[EarlyStopping] TRIGGERED at epoch {epoch}. "
+                        f"Restoring best checkpoint ({SELECTION_KEY}={best_metric:.4f})."
+                    )
+                    # Restore best weights before returning
+                    if os.path.exists(ckpt_path):
+                        load_checkpoint(ckpt_path, model)
+                        print(f"[EarlyStopping] Best weights restored from {ckpt_path}")
+                    _es_triggered = True
+                    break   # exit the epoch for-loop
+
     logger.close()
-    print(f"\nTraining complete. Best balanced_accuracy_at_optimal: {best_metric:.4f}")
+    _stop_reason = "early stopping" if _es_triggered else "epoch limit"
+    print(f"\nTraining complete ({_stop_reason}). "
+          f"Best balanced_accuracy_at_optimal: {best_metric:.4f}")
 
     # ── CHANGE 12d: end-of-run plots and CSV ──────────────────────────────────
     try:
@@ -457,6 +506,56 @@ def main(config: EAHNConfig):
         fig.savefig(out_path / "metric_curves.png", dpi=120)
         plt.close(fig)
         print(f"[plot] saved {out_path / 'metric_curves.png'}")
+
+        # Task 2.1: validation accuracy curves (4 lines, dual y-axis)
+        plots_dir = out_path / "plots"
+        plots_dir.mkdir(parents=True, exist_ok=True)
+        _manip = getattr(config, "active_manipulation", "")
+        fig2, ax2_acc = plt.subplots(figsize=(10, 6))
+        ax2_auc = ax2_acc.twinx()
+
+        ax2_acc.plot(
+            history["epoch"], history["val_balanced_acc"],
+            marker="o", linewidth=2.5, color="tab:blue",
+            label="val_balanced_accuracy",
+        )
+        ax2_acc.plot(
+            history["epoch"], history["val_real_acc"],
+            marker="s", linewidth=1.5, linestyle="--", color="tab:green",
+            label="val_real_accuracy",
+        )
+        ax2_acc.plot(
+            history["epoch"], history["val_fake_acc"],
+            marker="^", linewidth=1.5, linestyle="--", color="tab:red",
+            label="val_fake_accuracy",
+        )
+        ax2_acc.axhline(0.5, color="grey", linestyle=":", alpha=0.6, linewidth=1)
+        ax2_acc.set_xlabel("Epoch")
+        ax2_acc.set_ylabel("Accuracy / Balanced Accuracy", color="tab:blue")
+        ax2_acc.set_ylim(0, 1)
+        ax2_acc.tick_params(axis="y", labelcolor="tab:blue")
+
+        ax2_auc.plot(
+            history["epoch"], history["val_auc_roc"],
+            marker="D", linewidth=2, linestyle="-", color="tab:purple", alpha=0.7,
+            label="val_auc_roc",
+        )
+        ax2_auc.set_ylabel("AUC-ROC", color="tab:purple")
+        ax2_auc.set_ylim(0, 1)
+        ax2_auc.tick_params(axis="y", labelcolor="tab:purple")
+
+        # Combine legends from both axes
+        lines2a, labels2a = ax2_acc.get_legend_handles_labels()
+        lines2b, labels2b = ax2_auc.get_legend_handles_labels()
+        ax2_acc.legend(lines2a + lines2b, labels2a + labels2b, loc="lower right", fontsize=9)
+
+        title_manip = f" — {_manip}" if _manip else ""
+        fig2.suptitle(f"Validation Performance per Epoch{title_manip}", fontsize=13)
+        fig2.tight_layout()
+        _val_acc_path = plots_dir / "val_accuracy_curves.png"
+        fig2.savefig(_val_acc_path, dpi=120)
+        plt.close(fig2)
+        print(f"[plot] saved {_val_acc_path}")
 
     except Exception as _plot_err:
         print(f"[plot] Warning: could not generate training plots: {_plot_err}")

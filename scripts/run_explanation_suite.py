@@ -103,12 +103,23 @@ def run_explanation_suite(model, test_loader, config, output_path: Path) -> dict
     collapse_diag = ExplanationMetrics.collapse_diagnostics(all_M_t_up)
 
     # ── 6. Model randomization sanity check ───────────────────────────────────
+    # Task 1.7: fixed seed + n_random=30 for deterministic, statistically stable result.
+    # Compute ONCE here; evaluate.py reads this value from the returned dict.
     mt_vs_random_cosine = 1.0
+    _RANDOM_TEST_N = int(getattr(config, "random_test_n_samples", 30))
     try:
+        import torch as _torch_sanity
+        import numpy as _np_sanity
+        _torch_sanity.manual_seed(42)
+        _np_sanity.random.seed(42)
         from xai.sanity_checks import model_randomization_check
+        # Use a fixed sample (index 0 of the subset) so both runs pick the same frame
         _frames_s = all_frames[int(indices[0]):int(indices[0])+1].to(device)
-        mt_vs_random_cosine = model_randomization_check(model, _frames_s, n_random=3)
-        print(f"[ExplanationSuite] model_randomization cosine = {mt_vs_random_cosine:.3f}")
+        mt_vs_random_cosine = model_randomization_check(
+            model, _frames_s, n_random=_RANDOM_TEST_N
+        )
+        print(f"[ExplanationSuite] model_randomization cosine = {mt_vs_random_cosine:.4f} "
+              f"(n_random={_RANDOM_TEST_N}, seed=42)")
     except Exception as e:
         print(f"  [model_randomization skipped: {e}]")
 

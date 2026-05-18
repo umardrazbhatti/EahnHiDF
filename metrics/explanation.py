@@ -76,8 +76,8 @@ class ExplanationMetrics:
             ins_frames = torch.zeros_like(frames)
 
             for b in range(B):
-                flat_sal = sal[b].reshape(-1)                 # np.ndarray
-                top_k_idx = np.argsort(flat_sal)[-k:]         # top-k indices
+                flat_sal = sal[b].reshape(-1)                         # np.ndarray
+                top_k_idx = np.argsort(flat_sal)[-k:].copy()          # top-k, contiguous
                 mask     = np.zeros(H * W, dtype=bool)
                 mask[top_k_idx] = True
                 mask_2d  = mask.reshape(H, W)
@@ -174,6 +174,8 @@ class ExplanationMetrics:
 
         accum = {k: {"top": [], "rand": []} for k in k_values}
 
+        _debug_printed = False   # print diagnostics once for the first batch
+
         with torch.no_grad():
             for batch in loader:
                 frames = batch["frames"].to(device)          # (B, T, C, H, W)
@@ -183,12 +185,28 @@ class ExplanationMetrics:
                 orig_p  = out.prob.cpu()                      # (B,)
                 M_t     = out.M_t.cpu()                       # (B, T, h, w)
 
-                # Per-frame attention score = spatial mean of M_t
-                frame_scores = M_t.mean(dim=(-1, -2))         # (B, T)
+                # Task 1.3 diagnostic: dump raw M_t statistics once (first batch only)
+                if not _debug_printed:
+                    print(f"[DIAG frame_attn_drop] M_t shape: {M_t.shape}")
+                    print(f"[DIAG frame_attn_drop] M_t mean per frame:\n"
+                          f"  {M_t.mean(dim=(-1,-2))}")
+                    print(f"[DIAG frame_attn_drop] M_t max  per frame:\n"
+                          f"  {M_t.amax(dim=(-1,-2))}")
+                    print(f"[DIAG frame_attn_drop] M_t min  per frame:\n"
+                          f"  {M_t.amin(dim=(-1,-2))}")
+                    print(f"[DIAG frame_attn_drop] M_t std  per frame:\n"
+                          f"  {M_t.std(dim=(-1,-2))}")
+                    _debug_printed = True
+
+                # Task 1.3 fix (cause c): use peak intensity (amax) for frame ranking
+                # rather than mean — peak reflects the heatmap focus point, while
+                # mean collapses to a near-constant when maps are spatially diffuse.
+                frame_scores = M_t.amax(dim=(-1, -2))         # (B, T) — peak per frame
 
                 for b in range(B):
-                    scores_b  = frame_scores[b].numpy()        # (T,)
-                    ranked    = np.argsort(scores_b)[::-1]     # desc
+                    scores_b  = frame_scores[b].numpy()              # (T,)
+                    # .copy() prevents negative-stride error when indexing a tensor
+                    ranked    = np.argsort(scores_b)[::-1].copy()    # desc, contiguous
                     orig_prob = float(orig_p[b])
 
                     for k in k_values:
