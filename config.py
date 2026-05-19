@@ -19,7 +19,7 @@ class EAHNConfig:
     resume_checkpoint: str = ""
 
     # ── Dataset ───────────────────────────────────────────────────────────────
-    dataset_name: Literal["synthetic", "ff++", "celeb_df", "dfdc"] = "ff++"
+    dataset_name: Literal["synthetic", "ff++", "celeb_df", "dfdc", "hidf"] = "ff++"
     dataset_compression: str = "c23"
     num_frames: int = 16
     frame_size: int = 224
@@ -70,6 +70,10 @@ class EAHNConfig:
     active_manipulation: str = ""           # REQUIRED at CLI; specialist-only mode
     celebdf_root: str = ""                  # path to Celeb-DF v2 dataset root
     celebdf_eval: bool = False              # run Celeb-DF test eval after FF++ test eval
+    hidf_root: str = ""
+    ffpp_cross_eval: bool = False
+    ffpp_cross_root: str = ""
+    hidf_split_seed: int = 42
     save_last_checkpoint: bool = False      # Phase 16 leftover; OFF by default
     explanation_suite: bool = True          # run new explanation metrics block after eval
     save_heatmaps: bool = True
@@ -111,10 +115,10 @@ class EAHNConfig:
         for key, val in vars(args).items():
             if hasattr(cfg, key) and val is not None:
                 setattr(cfg, key, val)
-        if not cfg.active_manipulation:
+        if cfg.dataset_name == "ff++" and not cfg.active_manipulation:
             raise ValueError(
-                "--active_manipulation is required (specialist-only mode). "
-                "Pass one of: Deepfakes, Face2Face, FaceShifter, FaceSwap, NeuralTextures"
+                "--active_manipulation is required when --dataset_name ff++. "
+                "Choose one of: Deepfakes, Face2Face, FaceShifter, FaceSwap, NeuralTextures."
             )
         return cfg
 
@@ -125,7 +129,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--cache_dir", type=str, default=None)
     parser.add_argument("--dataset_name", type=str, default=None,
-                        choices=["synthetic", "ff++", "celeb_df", "dfdc"])
+                        choices=["synthetic", "ff++", "celeb_df", "dfdc", "hidf"])
     parser.add_argument("--dataset_compression", type=str, default=None,
                         help="FF++ compression level, e.g. c23 (default) or c40")
     parser.add_argument("--epochs", type=int, default=None)
@@ -172,6 +176,14 @@ def parse_args() -> argparse.Namespace:
                         help="Path to Celeb-DF v2 dataset root.")
     parser.add_argument("--celebdf_eval", action="store_true", default=None,
                         help="Run Celeb-DF v2 test evaluation after FF++ test eval.")
+    parser.add_argument("--hidf_root", type=str, default=None,
+                        help="HiDF dataset root (contains Real-vid/ and Fake-vid/)")
+    parser.add_argument("--ffpp_cross_eval", action="store_true", default=None,
+                        help="Run FF++ per-manipulation cross-evaluation after training")
+    parser.add_argument("--ffpp_cross_root", type=str, default=None,
+                        help="FF++ ffpp_data/ root for cross-evaluation")
+    parser.add_argument("--hidf_split_seed", type=int, default=None,
+                        help="Seed for HiDF source-grouped train/val/test split")
     parser.add_argument("--save_last_checkpoint", action="store_true", default=None,
                         help="Save last_checkpoint.pth after every epoch (for multi-session resume).")
     parser.add_argument("--explanation_suite", dest="explanation_suite",
