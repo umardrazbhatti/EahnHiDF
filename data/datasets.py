@@ -73,7 +73,7 @@ class DeepfakeDataset(Dataset):
         self,
         config,
         mode: Literal["train", "val", "test"],
-        dataset_type: Literal["synthetic", "ff++", "celeb_df", "dfdc"],
+        dataset_type: Literal["synthetic", "ff++", "celeb_df", "dfdc", "hidf"],
     ):
         self.config       = config
         self.mode         = mode
@@ -99,6 +99,8 @@ class DeepfakeDataset(Dataset):
             self._build_celeb_df()
         elif dataset_type == "dfdc":
             self._build_dfdc()
+        elif dataset_type == "hidf":
+            self._build_hidf()
         else:
             raise ValueError(f"Unknown dataset_type: '{dataset_type}'")
 
@@ -116,9 +118,10 @@ class DeepfakeDataset(Dataset):
             )
 
         # ── Stratified train / val / test split ──────────────────────────
-        self.samples = self._split(
-            self.samples, mode, config.train_split, config.val_split
-        )
+        if self.dataset_type != "hidf":
+            self.samples = self._split(
+                self.samples, mode, config.train_split, config.val_split
+            )
 
         if len(self.samples) == 0:
             raise RuntimeError(
@@ -274,6 +277,99 @@ class DeepfakeDataset(Dataset):
                 {"video_path": f"synthetic_{i}", "label": label,
                  "manipulation": "synthetic"}
             )
+
+    def _build_hidf(self):
+        """Build HiDF split (source-ID grouped, stratified).
+
+        HiDF layout:
+            {hidf_root}/Real-vid/c{NNNNN}.mp4          → label=0
+            {hidf_root}/Fake-vid/c{src}_c{tgt}.mp4     → label=1
+
+        LEAKAGE GUARD: Fake filenames begin with the source ID of a real
+        video (e.g., Fake-vid/c00003_c11507.mp4 is derived from
+        Real-vid/c00003.mp4). Splitting by file would let the model see a
+        test fake's source identity during training. We therefore split by
+        SOURCE ID — whole groups (one real + its derived fakes) go to a
+        single mode.
+        """
+        import re
+        from pathlib import Path
+        from numpy.random import default_rng
+
+        hidf_root = Path(self.config.hidf_root)
+        assert hidf_root.is_dir(), f"hidf_root not found: {hidf_root}"
+        real_dir = hidf_root / "Real-vid"
+        fake_dir = hidf_root / "Fake-vid"
+        assert real_dir.is_dir(), f"Real-vid missing under {hidf_root}"
+        assert fake_dir.is_dir(), f"Fake-vid missing under {hidf_root}"
+
+        real_videos = sorted(real_dir.glob("*.mp4"))
+        fake_videos = sorted(fake_dir.glob("*.mp4"))
+        assert len(real_videos) > 0, f"No real .mp4 in {real_dir}"
+        assert len(fake_videos) > 0, f"No fake .mp4 in {fake_dir}"
+
+        # Source ID = leading c\d+ prefix in the stem
+        SRC_RE = re.compile(r"^(c\d+)")
+
+        def source_id(p):
+            m = SRC_RE.match(p.stem)
+            return m.group(1) if m else p.stem
+
+        real_source_ids = [source_id(p) for p in real_videos]
+        n_unique = len(set(real_source_ids))
+        if n_unique != len(real_videos):
+            print(f"[HiDF] WARNING: {len(real_videos)} real files but "
+                  f"{n_unique} unique source IDs — duplicates exist.")
+
+        all_sources = sorted(set(real_source_ids))
+
+        # Deterministic split by source ID
+        seed = getattr(self.config, "hidf_split_seed", 42)
+        rng = default_rng(seed)
+        perm = rng.permutation(len(all_sources))
+        shuffled = [all_sources[i] for i in perm]
+
+        n = len(shuffled)
+        n_train = int(n * self.config.train_split)
+        n_val   = int(n * self.config.val_split)
+        train_set = set(shuffled[:n_train])
+        val_set   = set(shuffled[n_train:n_train + n_val])
+        test_set  = set(shuffled[n_train + n_val:])
+
+        if self.mode == "train":
+            active = train_set
+        elif self.mode == "val":
+            active = val_set
+        elif self.mode == "test":
+            active = test_set
+        else:
+            raise ValueError(f"Unknown mode: {self.mode}")
+
+        real_split = [p for p in real_videos if source_id(p) in active]
+        fake_split = [p for p in fake_videos if source_id(p) in active]
+
+        # Apply max_per_class cap if set (>0)
+        cap = getattr(self.config, "max_per_class", 0)
+        if cap and cap > 0:
+            rng2 = default_rng(seed)
+            if len(real_split) > cap:
+                idx = rng2.permutation(len(real_split))[:cap]
+                real_split = [real_split[i] for i in idx]
+            if len(fake_split) > cap:
+                idx = rng2.permutation(len(fake_split))[:cap]
+                fake_split = [fake_split[i] for i in idx]
+
+        self.samples = (
+            [{"video_path": str(p), "label": 0, "manipulation": "hidf_real"} for p in real_split] +
+            [{"video_path": str(p), "label": 1, "manipulation": "hidf_fake"} for p in fake_split]
+        )
+
+        print(
+            f"[HiDF {self.mode}] sources={len(active)}  "
+            f"real={sum(1 for s in self.samples if s['label'] == 0)}  "
+            f"fake={sum(1 for s in self.samples if s['label'] == 1)}  "
+            f"total={len(self.samples)}"
+        )
 
     # ====================================================================
     # Helpers
