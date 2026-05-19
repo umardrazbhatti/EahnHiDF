@@ -249,7 +249,7 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
 
     # ── Load model ────────────────────────────────────────────────────────────
     model     = EAHN(config).to(device)
-    ckpt_path = os.path.join(config.output_dir, "best_model.pth")
+    ckpt_path = os.path.join(config.output_dir, f"eahn_{config.dataset_name}_best.pth")
     if not os.path.exists(ckpt_path):
         import glob as _glob
         candidates = sorted(_glob.glob(
@@ -257,7 +257,7 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
         ))
         if candidates:
             ckpt_path = candidates[-1]
-            print(f"[Eval] best_model.pth not found — using {ckpt_path}")
+            print(f"[Eval] per-dataset checkpoint not found — using {ckpt_path}")
         else:
             raise FileNotFoundError(
                 f"No checkpoint found in {config.output_dir}. "

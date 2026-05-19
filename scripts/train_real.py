@@ -161,7 +161,7 @@ def main(config: EAHNConfig):
     )
     temp_loss_fn = TemporalConsistencyLoss(gamma=config.gamma)
 
-    ckpt_path = os.path.join(config.output_dir, "best_model.pth")
+    ckpt_path = os.path.join(config.output_dir, f"eahn_{config.dataset_name}_best.pth")
 
     # ── CHANGE 12a: epoch-level training history ───────────────────────────────
     history = {
