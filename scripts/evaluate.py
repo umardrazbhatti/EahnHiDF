@@ -53,6 +53,25 @@ from utils.visualization import (
 import cv2
 
 
+# ── Celeb-DF balanced sampling helper ────────────────────────────────
+
+def _balance_sample_celebdf(ds, n_per_class=100, seed=42):
+    """Restrict a CelebDFv2TestDataset to n_per_class real + n_per_class fake."""
+    import random
+    rng = random.Random(seed)
+    if hasattr(ds, "samples"):
+        items = ds.samples
+        real = [x for x in items if x[1] == 0]
+        fake = [x for x in items if x[1] == 1]
+        rng.shuffle(real)
+        rng.shuffle(fake)
+        ds.samples = real[:n_per_class] + fake[:n_per_class]
+    else:
+        raise RuntimeError("CelebDFv2TestDataset has no 'samples' attribute; "
+                           "update _balance_sample_celebdf accordingly.")
+    return ds
+
+
 # ── Detection graph helper ────────────────────────────────────────────────────
 
 def plot_evaluation_visuals(
@@ -699,6 +718,7 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
                 transform=_val_transform,
                 cache_dir=getattr(config, "cache_dir", None),
             )
+            celebdf_test = _balance_sample_celebdf(celebdf_test, n_per_class=100, seed=42)
             celebdf_loader = DataLoader(
                 celebdf_test, batch_size=config.batch_size, shuffle=False,
                 num_workers=config.num_workers, collate_fn=deepfake_collate_fn,
@@ -729,6 +749,67 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
             )
         except Exception as _cdf_err:
             print(f"[Celeb-DF] eval skipped: {_cdf_err}")
+
+    # ── FF++ per-manipulation cross-eval ──────────────────────────────
+    if getattr(config, "ffpp_cross_eval", False) and getattr(config, "ffpp_cross_root", ""):
+        import copy as _copy
+        try:
+            print("[FF++ cross-eval] starting per-manipulation evaluation")
+
+            FFPP_METHODS = ["Deepfakes", "Face2Face", "FaceShifter",
+                            "FaceSwap", "NeuralTextures"]
+            cross_eval_dir = os.path.join(config.output_dir, "eval")
+            os.makedirs(cross_eval_dir, exist_ok=True)
+
+            for manip in FFPP_METHODS:
+                print(f"[FF++ cross-eval] {manip}")
+                tcfg = _copy.deepcopy(config)
+                tcfg.dataset_name = "ff++"
+                tcfg.data_root = config.ffpp_cross_root
+                tcfg.active_manipulation = manip
+                tcfg.max_per_class = 100
+
+                try:
+                    ffpp_cross_ds = DeepfakeDataset(tcfg, "test", "ff++")
+                    cross_loader = DataLoader(
+                        ffpp_cross_ds,
+                        batch_size=config.batch_size,
+                        shuffle=False,
+                        collate_fn=deepfake_collate_fn,
+                        num_workers=config.num_workers,
+                    )
+
+                    _cx_probs, _cx_labels = [], []
+                    with torch.no_grad():
+                        for _cx_batch in tqdm(cross_loader, desc=f"  {manip}", leave=False):
+                            _cx_frames = _cx_batch["frames"].to(device)
+                            _cx_out    = model(_cx_frames)
+                            _cx_probs.extend(_cx_out.prob.cpu().tolist())
+                            _cx_labels.extend(_cx_batch["label"].cpu().tolist())
+
+                    _cx_metrics = DetectionMetrics.compute(_cx_probs, _cx_labels)
+                    _cx_metrics["manipulation"] = manip
+
+                    cell_dir = os.path.join(cross_eval_dir, f"ffpp_cross_{manip}")
+                    os.makedirs(cell_dir, exist_ok=True)
+                    with open(os.path.join(cell_dir, "metrics.json"), "w") as _cf:
+                        _json.dump(_cx_metrics, _cf, indent=2)
+
+                    _cx_opt_thr = float(_cx_metrics.get("optimal_threshold", 0.5))
+                    plot_evaluation_visuals(
+                        _cx_probs, _cx_labels,
+                        out_dir=cell_dir,
+                        prefix=f"ffpp_cross_{manip}",
+                        optimal_thr=_cx_opt_thr,
+                    )
+                    print(f"[FF++ cross-eval] {manip}: AUC-ROC={_cx_metrics.get('auc_roc', 0):.4f}")
+
+                except Exception as _cx_manip_err:
+                    print(f"[FF++ cross-eval] {manip} skipped: {_cx_manip_err}")
+
+            print("[FF++ cross-eval] done")
+        except Exception as _cx_err:
+            print(f"[FF++ cross-eval] skipped: {_cx_err}")
 
     # ── Explanation suite ────────────────────────────────────────────────────
     if getattr(config, "explanation_suite", True):
