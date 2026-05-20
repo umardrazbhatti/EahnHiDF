@@ -9,7 +9,7 @@ because we save our own trusted checkpoints (never load untrusted files this way
 import os
 import torch
 from typing import Any, Dict, Optional
-from config import EAHNConfig
+from HiDF_config import EAHNConfig
 
 
 def save_checkpoint(

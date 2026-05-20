@@ -21,7 +21,7 @@ from pathlib import Path
 from torch.utils.data import DataLoader
 from torch.amp import GradScaler, autocast
 
-from config import EAHNConfig, parse_args
+from HiDF_config import EAHNConfig, parse_args
 from data.datasets import DeepfakeDataset
 from data.collate import deepfake_collate_fn
 from models.eahn import EAHN
@@ -561,7 +561,7 @@ def main(config: EAHNConfig):
         print(f"[plot] Warning: could not generate training plots: {_plot_err}")
 
     if config.eval_after_train:
-        from scripts.evaluate import run_evaluation
+        from scripts.HiDF_evaluate import run_evaluation
         print("\n--- Starting evaluation ---")
         run_evaluation(config)
 

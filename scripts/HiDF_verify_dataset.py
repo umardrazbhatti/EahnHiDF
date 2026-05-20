@@ -63,7 +63,7 @@ def main():
     args = parser.parse_args()
 
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-    from config import EAHNConfig
+    from HiDF_config import EAHNConfig
     from data.datasets import DeepfakeDataset
     from data.collate import deepfake_collate_fn
 

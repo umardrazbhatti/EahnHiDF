@@ -37,7 +37,7 @@ from pathlib import Path as _PPath
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
-from config import EAHNConfig
+from HiDF_config import EAHNConfig
 from models.eahn import EAHN
 from data.datasets import DeepfakeDataset
 from data.collate import deepfake_collate_fn
@@ -447,7 +447,7 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
         **det_metrics,
         "tp": int(tp), "fp": int(fp), "tn": int(tn), "fn": int(fn),
     }
-    from scripts.summary_chart import plot_summary_chart
+    from scripts.HiDF_summary_chart import plot_summary_chart
     plot_summary_chart(metrics_dict_full, split_counts, config.output_dir)
 
     # ── Explanation metrics on a subset ──────────────────────────────────────
@@ -948,8 +948,8 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
     # ── Explanation suite ────────────────────────────────────────────────────
     if getattr(config, "explanation_suite", True):
         try:
-            from scripts.run_explanation_suite import run_explanation_suite
-            from scripts.save_xai_overlays import save_xai_overlays
+            from scripts.HiDF_run_explanation_suite import run_explanation_suite
+            from scripts.HiDF_save_xai_overlays import save_xai_overlays
             _exp_out_path = _PPath(config.output_dir) / "explanation_metrics.json"
             run_explanation_suite(model, test_loader, config, _exp_out_path)
             _overlay_dir = _PPath(config.output_dir) / "plots" / "heatmaps"
@@ -974,7 +974,7 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
     # ── Task 2.3: Auto-bundle analysis essentials ─────────────────────────────
     if getattr(config, "active_manipulation", ""):
         try:
-            from scripts.package_analysis_bundle import package_analysis_bundle
+            from scripts.HiDF_package_analysis_bundle import package_analysis_bundle
             _bundle_dir = os.path.join(config.output_dir, "analysis_essentials")
             package_analysis_bundle(
                 output_dir=config.output_dir,
@@ -1274,7 +1274,7 @@ if __name__ == "__main__":
     # Patch sys.argv so config.parse_args() sees only the standard flags
     _sys_main.argv = [_sys_main.argv[0]] + _remaining_argv
 
-    from config import parse_args as _parse_config_args, EAHNConfig as _EAHNConfig
+    from HiDF_config import parse_args as _parse_config_args, EAHNConfig as _EAHNConfig
     _args   = _parse_config_args()
     _config = _EAHNConfig.from_args(_args)
 

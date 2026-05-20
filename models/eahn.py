@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 
-from config import EAHNConfig
+from HiDF_config import EAHNConfig
 from models.spatial_stream import SpatialStream
 from models.temporal_stream import TemporalStream
 from models.cross_attention import CrossAttentionFusion

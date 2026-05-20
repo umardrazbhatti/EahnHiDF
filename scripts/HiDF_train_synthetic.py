@@ -5,8 +5,8 @@ committing GPU time on Kaggle.
 """
 
 import os
-from config import EAHNConfig
-from scripts.train_real import main as train_main
+from HiDF_config import EAHNConfig
+from scripts.HiDF_train_real import main as train_main
 
 
 def main():

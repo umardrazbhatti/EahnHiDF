@@ -21,9 +21,9 @@ Usage (local synthetic smoke test):
 """
 
 import os
-from config import EAHNConfig, parse_args
-from scripts.train_real import main as train_main
-from scripts.dashboard import show_dashboard
+from HiDF_config import EAHNConfig, parse_args
+from scripts.HiDF_train_real import main as train_main
+from scripts.HiDF_dashboard import show_dashboard
 
 
 def main():
