@@ -53,23 +53,103 @@ from utils.visualization import (
 import cv2
 
 
-# ── Celeb-DF balanced sampling helper ────────────────────────────────
+# ── Phase 19.2: Standalone balanced Celeb-DF sample ──────────────────────────────────────
 
-def _balance_sample_celebdf(ds, n_per_class=100, seed=42):
-    """Restrict a CelebDFv2TestDataset to n_per_class real + n_per_class fake."""
-    import random
-    rng = random.Random(seed)
-    if hasattr(ds, "samples"):
-        items = ds.samples
-        real = [x for x in items if x[1] == 0]
-        fake = [x for x in items if x[1] == 1]
-        rng.shuffle(real)
-        rng.shuffle(fake)
-        ds.samples = real[:n_per_class] + fake[:n_per_class]
-    else:
-        raise RuntimeError("CelebDFv2TestDataset has no 'samples' attribute; "
-                           "update _balance_sample_celebdf accordingly.")
-    return ds
+class _CelebDFBalancedSample(torch.utils.data.Dataset):
+    """Inline 100R+100F balanced sample of Celeb-DF v2.
+
+    Lists .mp4 files directly from Celeb-real / YouTube-real / Celeb-synthesis
+    and samples a fixed-seed balanced subset. Independent of
+    List_of_testing_videos.txt. Mirrors the frames+label+meta contract used
+    by DeepfakeDataset.
+    """
+
+    def __init__(self, root, num_frames, frame_size, face_aligner, transform,
+                 cache_dir, n_per_class=100, seed=42):
+        import glob
+        import random
+        rng = random.Random(seed)
+        real_paths = sorted(
+            glob.glob(os.path.join(root, "Celeb-real",   "*.mp4")) +
+            glob.glob(os.path.join(root, "YouTube-real", "*.mp4"))
+        )
+        fake_paths = sorted(glob.glob(os.path.join(root, "Celeb-synthesis", "*.mp4")))
+        if len(real_paths) < n_per_class:
+            raise RuntimeError(
+                f"Celeb-DF balanced sample: only {len(real_paths)} real "
+                f"videos found, need {n_per_class}"
+            )
+        if len(fake_paths) < n_per_class:
+            raise RuntimeError(
+                f"Celeb-DF balanced sample: only {len(fake_paths)} fake "
+                f"videos found, need {n_per_class}"
+            )
+        rng.shuffle(real_paths)
+        rng.shuffle(fake_paths)
+        self.items = (
+            [(p, 0) for p in real_paths[:n_per_class]] +
+            [(p, 1) for p in fake_paths[:n_per_class]]
+        )
+        self.num_frames   = num_frames
+        self.frame_size   = frame_size
+        self.face_aligner = face_aligner
+        self.transform    = transform
+        self.cache_dir    = cache_dir
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> dict:
+        video_path, label = self.items[idx]
+
+        frames_np = self._read_frames(video_path)
+
+        video_id  = os.path.splitext(os.path.basename(video_path))[0]
+        frames_np = self.face_aligner.align_frames(frames_np, video_id)
+
+        from PIL import Image as _Image
+        frames_tensor = torch.stack(
+            [self.transform(_Image.fromarray(f)) for f in frames_np]
+        )  # (T, 3, H, W)
+
+        return {
+            "frames": frames_tensor,
+            "label":  label,
+            "meta":   {"video_path": video_path, "frame_indices": []},
+        }
+
+    def _read_frames(self, video_path: str) -> list:
+        T = self.num_frames
+        try:
+            from decord import VideoReader as _VR, cpu as _decord_cpu
+            vr      = _VR(video_path, ctx=_decord_cpu(0))
+            total   = len(vr)
+            indices = np.linspace(0, total - 1, T, dtype=int).tolist()
+            batch   = vr.get_batch(indices).asnumpy()
+            return [batch[i] for i in range(T)]
+        except Exception:
+            pass
+        cap    = cv2.VideoCapture(video_path)
+        total  = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 1)
+        target = set(np.linspace(0, total - 1, T, dtype=int).tolist())
+        frames = []
+        fi     = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if fi in target:
+                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            fi += 1
+            if len(frames) == T:
+                break
+        cap.release()
+        if not frames:
+            frames = [np.zeros((self.frame_size, self.frame_size, 3), dtype=np.uint8)]
+        while len(frames) < T:
+            frames.append(frames[-1].copy())
+        return frames
+
 
 
 # ── Detection graph helper ────────────────────────────────────────────────────
@@ -703,113 +783,167 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
             _csv_writer.writerows(_bd_rows)
         print(f"[Evaluate] Breakdown CSV → {_csv_bd_path}")
 
-    # ── Celeb-DF v2 test evaluation ──────────────────────────────────────────
+    # ── Celeb-DF v2 cross-evaluation (Phase 19.2) ───────────────────────────────
     if getattr(config, "celebdf_eval", False) and getattr(config, "celebdf_root", ""):
+        import json as _json
+        from data.transforms import get_transforms as _get_transforms
+
+        print("\n" + "=" * 70)
+        print("[Celeb-DF cross-eval] balanced 100R+100F sample (Phase 19)")
+        print("=" * 70)
+
+        _transform = _get_transforms("test", config.frame_size)
+
+        _celeb_ds = _CelebDFBalancedSample(
+            root=config.celebdf_root,
+            num_frames=config.num_frames,
+            frame_size=config.frame_size,
+            face_aligner=test_ds.face_aligner,
+            transform=_transform,
+            cache_dir=getattr(config, "cache_dir", None),
+            n_per_class=100,
+            seed=42,
+        )
+        print(f"[Celeb-DF cross-eval] dataset size = {len(_celeb_ds)} "
+              f"(100R + 100F balanced)")
+
+        for _i, (_path, _lbl) in enumerate(_celeb_ds.items[:3]):
+            print(f"[Celeb-DF cross-eval] sample[{_i}] label={_lbl} path={_path}")
+
+        _loader = DataLoader(
+            _celeb_ds,
+            batch_size=config.batch_size,
+            shuffle=False,
+            collate_fn=deepfake_collate_fn,
+            num_workers=config.num_workers,
+        )
+
+        _probs_list, _labels_list = [], []
+        model.eval()
+        with torch.no_grad():
+            for _batch in _loader:
+                _frames = _batch["frames"].to(device)
+                _labels = _batch["label"]
+                _out = model(_frames)
+                _probs_list.extend(_out.prob.cpu().tolist())
+                _labels_list.extend(_labels.cpu().tolist())
+
+        _m = DetectionMetrics.compute(_probs_list, _labels_list)
+        _m["n_samples"] = len(_probs_list)
+        _m["sampling"] = "balanced_100R_100F_seed42"
+
+        _celebdf_json = os.path.join(eval_dir, "celebdf_test_metrics.json")
+        with open(_celebdf_json, "w") as _f:
+            _json.dump(_m, _f, indent=2)
+
         try:
-            print(f"\n[Celeb-DF] Loading test split from {config.celebdf_root} ...")
-            from data.celebdf_dataset import CelebDFv2TestDataset
-            from data.transforms import get_transforms as _get_transforms
-            _val_transform = _get_transforms("val", config.frame_size)
-            celebdf_test = CelebDFv2TestDataset(
-                root=config.celebdf_root,
-                num_frames=config.num_frames,
-                frame_size=config.frame_size,
-                face_aligner=test_ds.face_aligner,   # reuse existing aligner
-                transform=_val_transform,
-                cache_dir=getattr(config, "cache_dir", None),
-            )
-            celebdf_test = _balance_sample_celebdf(celebdf_test, n_per_class=100, seed=42)
-            celebdf_loader = DataLoader(
-                celebdf_test, batch_size=config.batch_size, shuffle=False,
-                num_workers=config.num_workers, collate_fn=deepfake_collate_fn,
-            )
-            # Run detection pass
-            _cdf_probs, _cdf_labels = [], []
-            with torch.no_grad():
-                for _cdf_batch in tqdm(celebdf_loader, desc="Celeb-DF eval"):
-                    _cdf_frames = _cdf_batch["frames"].to(device)
-                    _cdf_out    = model(_cdf_frames)
-                    _cdf_probs.extend(_cdf_out.prob.cpu().tolist())
-                    _cdf_labels.extend(_cdf_batch["label"].cpu().tolist())
-            celebdf_metrics = DetectionMetrics.compute(_cdf_probs, _cdf_labels)
-            celebdf_metrics["active_manipulation_trained_on"] = getattr(config, "active_manipulation", "")
-            celebdf_json_path = os.path.join(eval_dir, "celebdf_test_metrics.json")
-            with open(celebdf_json_path, "w") as _cdf_f:
-                _json.dump(celebdf_metrics, _cdf_f, indent=2)
-            print(f"[Celeb-DF] AUC-ROC={celebdf_metrics.get('auc_roc', 0):.4f} "
-                  f"F1={celebdf_metrics.get('f1_at_0.5', 0):.4f}")
-            print(f"[Celeb-DF] metrics saved → {celebdf_json_path}")
-
-            # Task 2.2: Generate full Celeb-DF visualizations
-            _cdf_opt_thr = float(celebdf_metrics.get("optimal_threshold", 0.5))
             plot_evaluation_visuals(
-                _cdf_probs, _cdf_labels,
-                out_dir=plots_dir, prefix="celebdf",
-                optimal_thr=_cdf_opt_thr,
+                _probs_list, _labels_list, plots_dir,
+                prefix="celebdf",
+                optimal_thr=_m.get("optimal_threshold", 0.5),
             )
-        except Exception as _cdf_err:
-            print(f"[Celeb-DF] eval skipped: {_cdf_err}")
+        except Exception as _plot_err:
+            print(f"[Celeb-DF cross-eval] plot failed: {_plot_err}")
 
-    # ── FF++ per-manipulation cross-eval ──────────────────────────────
+        print(f"[Celeb-DF cross-eval] AUC-ROC = {_m.get('auc_roc', 0):.4f}  "
+              f"AUC-PR = {_m.get('auc_pr', 0):.4f}  "
+              f"F1@opt = {_m.get('f1_at_optimal', 0):.4f}")
+        print(f"[Celeb-DF cross-eval] metrics saved -> {_celebdf_json}")
+
+
+    # ────────────────────────────────────────────────────────────────────
+    # FF++ per-manipulation cross-evaluation (Phase 19.1 — bug fix)
+    # Replaces the Phase 18.4 block which evaluated the same data 5 times.
+    # ────────────────────────────────────────────────────────────────────
     if getattr(config, "ffpp_cross_eval", False) and getattr(config, "ffpp_cross_root", ""):
         import copy as _copy
-        try:
-            print("[FF++ cross-eval] starting per-manipulation evaluation")
+        import json as _json
+        from pathlib import Path as _Path
 
-            FFPP_METHODS = ["Deepfakes", "Face2Face", "FaceShifter",
-                            "FaceSwap", "NeuralTextures"]
-            cross_eval_dir = os.path.join(config.output_dir, "eval")
-            os.makedirs(cross_eval_dir, exist_ok=True)
+        print("\n" + "=" * 70)
+        print("[FF++ cross-eval] starting per-manipulation evaluation (Phase 19)")
+        print("=" * 70)
 
-            for manip in FFPP_METHODS:
-                print(f"[FF++ cross-eval] {manip}")
-                tcfg = _copy.deepcopy(config)
-                tcfg.dataset_name = "ff++"
-                tcfg.data_root = config.ffpp_cross_root
-                tcfg.active_manipulation = manip
-                tcfg.max_per_class = 100
+        FFPP_METHODS = ["Deepfakes", "Face2Face", "FaceShifter",
+                        "FaceSwap", "NeuralTextures"]
 
-                try:
-                    ffpp_cross_ds = DeepfakeDataset(tcfg, "test", "ff++")
-                    cross_loader = DataLoader(
-                        ffpp_cross_ds,
-                        batch_size=config.batch_size,
-                        shuffle=False,
-                        collate_fn=deepfake_collate_fn,
-                        num_workers=config.num_workers,
-                    )
+        _eval_root = _Path(config.output_dir) / "eval"
+        _eval_root.mkdir(parents=True, exist_ok=True)
 
-                    _cx_probs, _cx_labels = [], []
-                    with torch.no_grad():
-                        for _cx_batch in tqdm(cross_loader, desc=f"  {manip}", leave=False):
-                            _cx_frames = _cx_batch["frames"].to(device)
-                            _cx_out    = model(_cx_frames)
-                            _cx_probs.extend(_cx_out.prob.cpu().tolist())
-                            _cx_labels.extend(_cx_batch["label"].cpu().tolist())
+        for _manip in FFPP_METHODS:
+            print(f"\n[FF++ cross-eval] === {_manip} ===")
 
-                    _cx_metrics = DetectionMetrics.compute(_cx_probs, _cx_labels)
-                    _cx_metrics["manipulation"] = manip
+            # CRITICAL: fresh accumulators every iteration
+            _probs_list = []
+            _labels_list = []
 
-                    cell_dir = os.path.join(cross_eval_dir, f"ffpp_cross_{manip}")
-                    os.makedirs(cell_dir, exist_ok=True)
-                    with open(os.path.join(cell_dir, "metrics.json"), "w") as _cf:
-                        _json.dump(_cx_metrics, _cf, indent=2)
+            # CRITICAL: fresh config every iteration (deep-copy + explicit overrides)
+            _tcfg = _copy.deepcopy(config)
+            _tcfg.dataset_name        = "ff++"
+            _tcfg.data_root           = config.ffpp_cross_root
+            _tcfg.active_manipulation = _manip
+            _tcfg.max_per_class       = 100
+            _tcfg.ffpp_cross_eval     = False
+            _tcfg.celebdf_eval        = False
+            _tcfg.explanation_suite   = False
 
-                    _cx_opt_thr = float(_cx_metrics.get("optimal_threshold", 0.5))
-                    plot_evaluation_visuals(
-                        _cx_probs, _cx_labels,
-                        out_dir=cell_dir,
-                        prefix=f"ffpp_cross_{manip}",
-                        optimal_thr=_cx_opt_thr,
-                    )
-                    print(f"[FF++ cross-eval] {manip}: AUC-ROC={_cx_metrics.get('auc_roc', 0):.4f}")
+            # CRITICAL: fresh dataset construction every iteration
+            _ffpp_ds = DeepfakeDataset(_tcfg, "test", "ff++")
+            print(f"[FF++ cross-eval] {_manip}: dataset size = {len(_ffpp_ds)}")
 
-                except Exception as _cx_manip_err:
-                    print(f"[FF++ cross-eval] {manip} skipped: {_cx_manip_err}")
+            # SANITY: print first 3 sample paths so we can prove the data differs
+            _first3 = _ffpp_ds.samples[:3]
+            for _i, _s in enumerate(_first3):
+                _path = _s["video_path"] if isinstance(_s, dict) else _s[0]
+                _lbl  = _s["label"]      if isinstance(_s, dict) else _s[1]
+                print(f"[FF++ cross-eval] {_manip}: sample[{_i}] label={_lbl} path={_path}")
 
-            print("[FF++ cross-eval] done")
-        except Exception as _cx_err:
-            print(f"[FF++ cross-eval] skipped: {_cx_err}")
+            _loader = DataLoader(
+                _ffpp_ds,
+                batch_size=config.batch_size,
+                shuffle=False,
+                collate_fn=deepfake_collate_fn,
+                num_workers=config.num_workers,
+            )
+
+            # Forward loop — mirrors main FF++ eval pattern in this file
+            model.eval()
+            with torch.no_grad():
+                for _batch in _loader:
+                    _frames = _batch["frames"].to(device)
+                    _labels = _batch["label"]
+                    _out = model(_frames)
+                    _probs_list.extend(_out.prob.cpu().tolist())
+                    _labels_list.extend(_labels.cpu().tolist())
+
+            print(f"[FF++ cross-eval] {_manip}: collected {len(_probs_list)} predictions")
+            print(f"[FF++ cross-eval] {_manip}: prob[min,mean,max] = "
+                  f"[{min(_probs_list):.4f}, {sum(_probs_list)/len(_probs_list):.4f}, "
+                  f"{max(_probs_list):.4f}]")
+
+            _m = DetectionMetrics.compute(_probs_list, _labels_list)
+            _m["manipulation"] = _manip
+            _m["n_samples"] = len(_probs_list)
+
+            _cell_dir = _eval_root / f"ffpp_cross_{_manip}"
+            _cell_dir.mkdir(exist_ok=True)
+            with open(_cell_dir / "metrics.json", "w") as _f:
+                _json.dump(_m, _f, indent=2)
+
+            try:
+                plot_evaluation_visuals(
+                    _probs_list, _labels_list, str(_cell_dir),
+                    prefix=f"ffpp_cross_{_manip}",
+                    optimal_thr=_m.get("optimal_threshold", 0.5),
+                )
+            except Exception as _plot_err:
+                print(f"[FF++ cross-eval] {_manip}: plot failed: {_plot_err}")
+
+            print(f"[FF++ cross-eval] {_manip}: AUC-ROC = {_m.get('auc_roc', 0):.4f}  "
+                  f"AUC-PR = {_m.get('auc_pr', 0):.4f}  F1@opt = {_m.get('f1_at_optimal', 0):.4f}")
+
+        print("\n[FF++ cross-eval] done.")
+
 
     # ── Explanation suite ────────────────────────────────────────────────────
     if getattr(config, "explanation_suite", True):

@@ -56,6 +56,10 @@ def main():
                         help="Verify Celeb-DF root directories")
     parser.add_argument("--celebdf_root", type=str, default=None,
                         help="Celeb-DF v2 root for verification")
+    parser.add_argument("--output_dir", type=str, default=None,
+                        help="(no-op, accepted for caller compatibility)")
+    parser.add_argument("--cache_dir", type=str, default=None,
+                        help="(no-op, accepted for caller compatibility)")
     args = parser.parse_args()
 
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
