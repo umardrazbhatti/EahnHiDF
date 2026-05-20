@@ -787,6 +787,7 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
     if getattr(config, "celebdf_eval", False) and getattr(config, "celebdf_root", ""):
         import json as _json
         from data.HiDF_transforms import get_transforms as _get_transforms
+        from data.HiDF_face_align import FaceAligner as _FaceAligner
 
         print("\n" + "=" * 70)
         print("[Celeb-DF cross-eval] balanced 100R+100F sample (Phase 19)")
@@ -794,13 +795,19 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
 
         _transform = _get_transforms("test", config.frame_size)
 
+        _face_aligner = _FaceAligner(
+            margin=0.30,
+            cache_dir=None,           # Phase 19 fix: no disk cache during cross-eval
+            device="cpu",
+        )
+
         _celeb_ds = _CelebDFBalancedSample(
             root=config.celebdf_root,
             num_frames=config.num_frames,
             frame_size=config.frame_size,
-            face_aligner=test_ds.face_aligner,
+            face_aligner=_face_aligner,
             transform=_transform,
-            cache_dir=getattr(config, "cache_dir", None),
+            cache_dir=None,
             n_per_class=100,
             seed=42,
         )
