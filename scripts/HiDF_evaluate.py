@@ -886,6 +886,7 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
             _tcfg.ffpp_cross_eval     = False
             _tcfg.celebdf_eval        = False
             _tcfg.explanation_suite   = False
+            _tcfg.cache_dir           = None   # no disk cache during cross-eval — avoids filling /kaggle/working
 
             # CRITICAL: fresh dataset construction every iteration
             _ffpp_ds = DeepfakeDataset(_tcfg, "test", "ff++")
