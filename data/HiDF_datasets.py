@@ -43,9 +43,9 @@ except ImportError:
         "Install with: pip install decord"
     )
 
-from data.face_align import FaceAligner
-from data.transforms import get_transforms, get_heavy_transforms
-from data.synthetic_generator import SyntheticDataGenerator
+from data.HiDF_face_align import FaceAligner
+from data.HiDF_transforms import get_transforms, get_heavy_transforms
+from data.HiDF_synthetic_generator import SyntheticDataGenerator
 
 # ---------------------------------------------------------------------------
 # FF++ manipulation methods in this dataset snapshot

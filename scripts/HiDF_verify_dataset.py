@@ -64,8 +64,8 @@ def main():
 
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
     from HiDF_config import EAHNConfig
-    from data.datasets import DeepfakeDataset
-    from data.collate import deepfake_collate_fn
+    from data.HiDF_datasets import DeepfakeDataset
+    from data.HiDF_collate import deepfake_collate_fn
 
     compression = "c23"
     MANIPULATIONS = ["Deepfakes", "Face2Face", "FaceShifter", "FaceSwap", "NeuralTextures"]
@@ -162,7 +162,7 @@ def main():
             print("\n=== Model Forward-Pass Check ===")
             if batch is not None:
                 try:
-                    from models.eahn import EAHN
+                    from models.HiDF_eahn import EAHN
                     model = EAHN(config).to("cpu")
                     model.eval()
                     with torch.no_grad():
@@ -271,7 +271,7 @@ def main():
             print("\n=== HiDF Model Forward-Pass Check ===")
             if hidf_batch is not None:
                 try:
-                    from models.eahn import EAHN
+                    from models.HiDF_eahn import EAHN
                     model = EAHN(config).to("cpu")
                     model.eval()
                     with torch.no_grad():

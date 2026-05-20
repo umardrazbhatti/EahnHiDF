@@ -11,7 +11,7 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 
-from metrics.explanation import ExplanationMetrics
+from metrics.HiDF_explanation import ExplanationMetrics
 
 
 def run_explanation_suite(model, test_loader, config, output_path: Path) -> dict:
@@ -112,7 +112,7 @@ def run_explanation_suite(model, test_loader, config, output_path: Path) -> dict
         import numpy as _np_sanity
         _torch_sanity.manual_seed(42)
         _np_sanity.random.seed(42)
-        from xai.sanity_checks import model_randomization_check
+        from xai.HiDF_sanity_checks import model_randomization_check
         # Use a fixed sample (index 0 of the subset) so both runs pick the same frame
         _frames_s = all_frames[int(indices[0]):int(indices[0])+1].to(device)
         mt_vs_random_cosine = model_randomization_check(

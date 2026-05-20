@@ -38,13 +38,13 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 
 from HiDF_config import EAHNConfig
-from models.eahn import EAHN
-from data.datasets import DeepfakeDataset
-from data.collate import deepfake_collate_fn
-from metrics.detection import DetectionMetrics
-from metrics.explanation import ExplanationMetrics
-from utils.checkpointing import load_checkpoint
-from utils.visualization import (
+from models.HiDF_eahn import EAHN
+from data.HiDF_datasets import DeepfakeDataset
+from data.HiDF_collate import deepfake_collate_fn
+from metrics.HiDF_detection import DetectionMetrics
+from metrics.HiDF_explanation import ExplanationMetrics
+from utils.HiDF_checkpointing import load_checkpoint
+from utils.HiDF_visualization import (
     save_annotated_frame_strip,
     save_explanation_video,
     overlay_heatmap_on_frame,
@@ -786,7 +786,7 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
     # ── Celeb-DF v2 cross-evaluation (Phase 19.2) ───────────────────────────────
     if getattr(config, "celebdf_eval", False) and getattr(config, "celebdf_root", ""):
         import json as _json
-        from data.transforms import get_transforms as _get_transforms
+        from data.HiDF_transforms import get_transforms as _get_transforms
 
         print("\n" + "=" * 70)
         print("[Celeb-DF cross-eval] balanced 100R+100F sample (Phase 19)")
@@ -992,9 +992,9 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
 
 def _generate_heatmaps(config, model, test_ds, sample_indices, device, all_probs,
                        batch_inter_sample_sim: float = 0.0):
-    from xai.gradcam import GradCAMExplainer
-    from xai.attention_rollout import AttentionRolloutExplainer
-    from xai.shap_explainer import SHAPExplainer
+    from xai.HiDF_gradcam import GradCAMExplainer
+    from xai.HiDF_attention_rollout import AttentionRolloutExplainer
+    from xai.HiDF_shap_explainer import SHAPExplainer
 
     # Canonical layout (Task 1.4):
     #   heatmaps/       → multi-frame strip PNGs + MP4 overlay videos

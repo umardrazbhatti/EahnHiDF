@@ -22,15 +22,15 @@ from torch.utils.data import DataLoader
 from torch.amp import GradScaler, autocast
 
 from HiDF_config import EAHNConfig, parse_args
-from data.datasets import DeepfakeDataset
-from data.collate import deepfake_collate_fn
-from models.eahn import EAHN
-from losses.classification import build_classification_loss
-from losses.explanation import ExplanationLoss
-from losses.temporal import TemporalConsistencyLoss
-from metrics.detection import DetectionMetrics
-from utils.checkpointing import save_checkpoint, load_checkpoint
-from utils.logging_utils import Logger
+from data.HiDF_datasets import DeepfakeDataset
+from data.HiDF_collate import deepfake_collate_fn
+from models.HiDF_eahn import EAHN
+from losses.HiDF_classification import build_classification_loss
+from losses.HiDF_explanation import ExplanationLoss
+from losses.HiDF_temporal import TemporalConsistencyLoss
+from metrics.HiDF_detection import DetectionMetrics
+from utils.HiDF_checkpointing import save_checkpoint, load_checkpoint
+from utils.HiDF_logging_utils import Logger
 
 
 def main(config: EAHNConfig):
@@ -195,7 +195,7 @@ def main(config: EAHNConfig):
     _clean_ds = deepcopy(train_ds)
     _clean_ds.heavy_aug = False
     # Force every getitem to use the VAL transform (deterministic resize+norm):
-    from data.transforms import get_transforms
+    from data.HiDF_transforms import get_transforms
     _clean_ds.transform = get_transforms("val", config.frame_size)
     # Also disable the heavy-aug branch entirely by setting minority_class to
     # a sentinel that never matches any real label:

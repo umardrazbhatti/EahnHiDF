@@ -23,7 +23,7 @@ import torch
 from pathlib import Path
 from tqdm import tqdm
 
-from utils.visualization import overlay_heatmap_on_frame
+from utils.HiDF_visualization import overlay_heatmap_on_frame
 
 
 def _ensure_uint8_bgr(img) -> np.ndarray:
@@ -153,8 +153,8 @@ def save_xai_overlays(model, test_loader, config, output_dir: Path):
           f"real={len(selected.get('real',[]))} fake={len(selected.get('fake',[]))}")
 
     # ── Load explainers ───────────────────────────────────────────────────────
-    from xai.gradcam import GradCAMExplainer
-    from xai.attention_rollout import AttentionRolloutExplainer
+    from xai.HiDF_gradcam import GradCAMExplainer
+    from xai.HiDF_attention_rollout import AttentionRolloutExplainer
 
     gradcam_exp = GradCAMExplainer(
         model, target_layer=model.spatial_stream.grad_cam_target_layer

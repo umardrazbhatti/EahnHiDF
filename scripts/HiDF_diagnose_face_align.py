@@ -320,7 +320,7 @@ def main() -> None:
         sys.path.insert(0, repo_root)
 
     # ── Load FaceAligner (production class — unchanged) ───────────────────
-    from data.face_align import FaceAligner
+    from data.HiDF_face_align import FaceAligner
     # cache_dir=None → no cache writes; no side effects on training pipeline
     face_aligner = FaceAligner(margin=_MARGIN, cache_dir=None, device="cpu")
 
