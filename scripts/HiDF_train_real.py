@@ -16,6 +16,7 @@ import csv as _csv
 import dataclasses as _dataclasses
 import math
 import torch
+import torch.nn.functional as F
 import numpy as np
 from pathlib import Path
 from torch.utils.data import DataLoader
@@ -222,7 +223,7 @@ def main(config: EAHNConfig):
 
         # ── CHANGE 3: rolling log accumulator ────────────────────────────────
         LOG_EVERY = 200
-        run = {"total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0, "n": 0}
+        run = {"total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0, "cons": 0.0, "n": 0}
 
         for batch_idx, batch in enumerate(train_loader):
             frames   = batch["frames"].to(device, non_blocking=True)
@@ -237,6 +238,22 @@ def main(config: EAHNConfig):
                 _global_step = (epoch - 1) * len(train_loader) + batch_idx
                 _lambda1_eff = config.lambda1 * min(1.0, _global_step / 200.0)
                 l_total  = l_cls + _lambda1_eff * l_exp + config.lambda2 * l_temp
+
+                # Consistency regularization — penalise augmented branch for deviating
+                # from clean-branch prediction.  Clean branch runs under no_grad so
+                # only the augmented branch receives the gradient signal.
+                _lambda_cons = float(getattr(config, "lambda_consistency", 0.0))
+                if _lambda_cons > 0 and "frames_clean" in batch:
+                    _frames_clean = batch["frames_clean"].to(device, non_blocking=True)
+                    with torch.no_grad():
+                        _out_clean = model(_frames_clean)
+                    _probs_clean = _out_clean.prob.detach()
+                    _probs_aug   = out.prob
+                    l_consistency = F.mse_loss(_probs_aug, _probs_clean)
+                    l_total = l_total + _lambda_cons * l_consistency
+                else:
+                    l_consistency = torch.tensor(0.0)
+
                 loss     = l_total / config.grad_accum_steps
 
             scaler.scale(loss).backward()
@@ -267,9 +284,11 @@ def main(config: EAHNConfig):
             _lc = l_cls.item()
             _le = l_exp.item()
             _lp = l_temp.item()
+            _lcons = l_consistency.item()
 
             run["total"] += _lt;  run["cls"] += _lc
-            run["exp"]   += _le;  run["temp"] += _lp;  run["n"] += 1
+            run["exp"]   += _le;  run["temp"] += _lp
+            run["cons"]  += _lcons;  run["n"] += 1
 
             epoch_acc["total"] += _lt;  epoch_acc["cls"] += _lc
             epoch_acc["exp"]   += _le;  epoch_acc["temp"] += _lp;  epoch_acc["n"] += 1
@@ -282,9 +301,10 @@ def main(config: EAHNConfig):
                     f"[E{epoch:>{epoch_w}} {batch_idx+1:4d}/{total_batches}] "
                     f"total={run['total']/n:.4f}  cls={run['cls']/n:.4f}  "
                     f"exp={run['exp']/n:.4f}  temp={run['temp']/n:.4f}  "
+                    f"cons={run['cons']/n:.4f}  "
                     f"tau={_tau:.2f}  sim={exp_out.inter_sample_sim:.2f}"
                 )
-                run = {"total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0, "n": 0}
+                run = {"total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0, "cons": 0.0, "n": 0}
 
         scheduler.step()
 
@@ -372,6 +392,22 @@ def main(config: EAHNConfig):
         print(f"[sanity] epoch={epoch} train_clean: real_acc={_clean_real_acc:.3f} "
               f"fake_acc={_clean_fake_acc:.3f}  "
               f"(if real_acc is much lower than val real_acc, aug shortcut still live)")
+
+        # Augmentation shortcut gate: fake_acc on clean (unaugmented) train data
+        # should climb above 0.20 by epoch 2 if the model is learning real fake features.
+        if _clean_fake_acc < 0.20:
+            print(
+                f"[sanity] WARNING — AUGMENTATION SHORTCUT DETECTED: "
+                f"train_clean fake_acc={_clean_fake_acc:.3f} < 0.20. "
+                f"Model is using augmentation artifacts as fake signal. "
+                f"Check HiDF_transforms.py — Fix 1 may not have applied correctly."
+            )
+            if epoch >= 2:
+                print(
+                    f"[sanity] STOP CONDITION: train_clean fake_acc still < 0.20 at epoch {epoch}. "
+                    f"Do not continue training — diagnose augmentation pipeline first."
+                )
+
         model.train()
 
         # ── Checkpoint ────────────────────────────────────────────────────────

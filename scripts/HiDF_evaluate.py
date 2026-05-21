@@ -53,6 +53,39 @@ from utils.HiDF_visualization import (
 import cv2
 
 
+# ── Phase 19.9: Test-time augmentation helper ────────────────────────────────────────────
+
+def run_tta_forward(model, frames, n_tta: int = 4, device: str = "cpu"):
+    """
+    Run N augmented forward passes and average probabilities.
+
+    frames : Tensor (B, T, 3, H, W) already on device.
+    Returns averaged prob tensor (B,).
+    4 augmented passes + 1 clean pass = 5 total.
+    """
+    all_probs = []
+    for _ in range(n_tta):
+        # Horizontal flip with p=0.5
+        if torch.rand(1).item() > 0.5:
+            frames_aug = torch.flip(frames, dims=[-1])
+        else:
+            frames_aug = frames
+        # Mild brightness jitter (stay within normalised range)
+        frames_aug = frames_aug + torch.randn_like(frames_aug) * 0.02
+        frames_aug = frames_aug.clamp(-3, 3)
+
+        with torch.no_grad():
+            out = model(frames_aug)
+        all_probs.append(out.prob.squeeze(-1))
+
+    # Also include the clean (no augmentation) pass
+    with torch.no_grad():
+        out_clean = model(frames)
+    all_probs.append(out_clean.prob.squeeze(-1))
+
+    return torch.stack(all_probs, dim=0).mean(dim=0)
+
+
 # ── Phase 19.2: Standalone balanced Celeb-DF sample ──────────────────────────────────────
 
 class _CelebDFBalancedSample(torch.utils.data.Dataset):
@@ -390,6 +423,11 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
 
     det_metrics = DetectionMetrics.compute(all_probs, all_labels)
     print("Detection Metrics:", det_metrics)
+
+    # Phase 19.9: calibrated threshold for cross-dataset eval
+    hidf_optimal_threshold = float(det_metrics.get("optimal_threshold", 0.5))
+    print(f"[Calibration] HiDF optimal threshold = {hidf_optimal_threshold:.4f}  "
+          f"(will be used for F1/balanced-accuracy in all cross-dataset blocks)")
 
     # ── Confusion matrix (5a) ─────────────────────────────────────────────────
     from sklearn.metrics import confusion_matrix as sk_confusion_matrix
@@ -827,17 +865,26 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
 
         _probs_list, _labels_list = [], []
         model.eval()
-        with torch.no_grad():
-            for _batch in _loader:
-                _frames = _batch["frames"].to(device)
-                _labels = _batch["label"]
-                _out = model(_frames)
-                _probs_list.extend(_out.prob.cpu().tolist())
-                _labels_list.extend(_labels.cpu().tolist())
+        for _batch in _loader:
+            _frames = _batch["frames"].to(device)
+            _labels = _batch["label"]
+            _avg_probs = run_tta_forward(model, _frames, n_tta=4, device=str(device))
+            _probs_list.extend(_avg_probs.cpu().tolist())
+            _labels_list.extend(_labels.cpu().tolist())
 
         _m = DetectionMetrics.compute(_probs_list, _labels_list)
         _m["n_samples"] = len(_probs_list)
         _m["sampling"] = "balanced_100R_100F_seed42"
+        _m["tta_passes"] = 5  # 4 augmented + 1 clean
+        _m["calibrated_threshold_used"] = hidf_optimal_threshold
+
+        # Extra metrics at HiDF calibrated threshold
+        _probs_np_cd = np.array(_probs_list)
+        _labels_np_cd = np.array(_labels_list, dtype=int)
+        _preds_cal = (_probs_np_cd >= hidf_optimal_threshold).astype(int)
+        from sklearn.metrics import f1_score as _f1_score, balanced_accuracy_score as _bal_acc_score
+        _m["f1_at_hidf_threshold"] = float(_f1_score(_labels_np_cd, _preds_cal, zero_division=0))
+        _m["balanced_accuracy_at_hidf_threshold"] = float(_bal_acc_score(_labels_np_cd, _preds_cal))
 
         _celebdf_json = os.path.join(eval_dir, "celebdf_test_metrics.json")
         with open(_celebdf_json, "w") as _f:
@@ -914,15 +961,14 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
                 num_workers=config.num_workers,
             )
 
-            # Forward loop — mirrors main FF++ eval pattern in this file
+            # Forward loop — TTA (4 augmented + 1 clean) for cross-dataset robustness
             model.eval()
-            with torch.no_grad():
-                for _batch in _loader:
-                    _frames = _batch["frames"].to(device)
-                    _labels = _batch["label"]
-                    _out = model(_frames)
-                    _probs_list.extend(_out.prob.cpu().tolist())
-                    _labels_list.extend(_labels.cpu().tolist())
+            for _batch in _loader:
+                _frames = _batch["frames"].to(device)
+                _labels = _batch["label"]
+                _avg_probs = run_tta_forward(model, _frames, n_tta=4, device=str(device))
+                _probs_list.extend(_avg_probs.cpu().tolist())
+                _labels_list.extend(_labels.cpu().tolist())
 
             print(f"[FF++ cross-eval] {_manip}: collected {len(_probs_list)} predictions")
             print(f"[FF++ cross-eval] {_manip}: prob[min,mean,max] = "
@@ -932,6 +978,16 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
             _m = DetectionMetrics.compute(_probs_list, _labels_list)
             _m["manipulation"] = _manip
             _m["n_samples"] = len(_probs_list)
+            _m["tta_passes"] = 5  # 4 augmented + 1 clean
+            _m["calibrated_threshold_used"] = hidf_optimal_threshold
+
+            # Extra metrics at HiDF calibrated threshold
+            _probs_np_ff = np.array(_probs_list)
+            _labels_np_ff = np.array(_labels_list, dtype=int)
+            _preds_cal_ff = (_probs_np_ff >= hidf_optimal_threshold).astype(int)
+            from sklearn.metrics import f1_score as _f1_score_ff, balanced_accuracy_score as _bal_acc_ff
+            _m["f1_at_hidf_threshold"] = float(_f1_score_ff(_labels_np_ff, _preds_cal_ff, zero_division=0))
+            _m["balanced_accuracy_at_hidf_threshold"] = float(_bal_acc_ff(_labels_np_ff, _preds_cal_ff))
 
             _cell_dir = _eval_root / f"ffpp_cross_{_manip}"
             _cell_dir.mkdir(exist_ok=True)

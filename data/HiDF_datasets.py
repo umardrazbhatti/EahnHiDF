@@ -79,6 +79,8 @@ class DeepfakeDataset(Dataset):
         self.mode         = mode
         self.dataset_type = dataset_type
         self.transform    = get_transforms(mode, config.frame_size)
+        # Clean (val-style) transform — used by consistency regularization in train mode
+        self.clean_transform = get_transforms("val", config.frame_size)
         self.heavy_aug: bool = False
         self.minority_class: int = 1
         self.samples: list[dict] = []
@@ -501,7 +503,7 @@ class DeepfakeDataset(Dataset):
             [aug(Image.fromarray(f)) for f in frames_np]
         )  # (T, 3, H, W)
 
-        return {
+        result = {
             "frames": frames_tensor,
             "label":  label,
             "meta": {
@@ -509,6 +511,15 @@ class DeepfakeDataset(Dataset):
                 "frame_indices": [],
             },
         }
+
+        # Consistency regularization: also return clean (val-transform) version during training
+        if self.mode == "train":
+            frames_clean_tensor = torch.stack(
+                [self.clean_transform(Image.fromarray(f)) for f in frames_np]
+            )  # (T, 3, H, W)
+            result["frames_clean"] = frames_clean_tensor
+
+        return result
 
     def _read_frames(self, video_path: str) -> list[np.ndarray]:
         """

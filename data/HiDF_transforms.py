@@ -17,23 +17,18 @@ _STD  = [0.229, 0.224, 0.225]
 
 def get_heavy_transforms(frame_size: int = 224):
     """
-    Heavy augmentation for minority-class samples when class imbalance ratio > 3:1.
-    Applied only during training, only to the minority class.
-    Includes: horizontal flip, stronger colour jitter, small rotation,
-              Gaussian blur, and perspective distortion.
+    Minority-class augmentation — kept identical to the standard training
+    pipeline (Fix 1) to prevent augmentation-artifact shortcut learning.
     """
     return transforms.Compose([
         transforms.Resize((frame_size, frame_size)),
-        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomHorizontalFlip(p=0.3),
         transforms.ColorJitter(
-            brightness=0.4,
-            contrast=0.4,
-            saturation=0.3,
-            hue=0.1,
+            brightness=0.05,
+            contrast=0.05,
+            saturation=0.05,
+            hue=0.02,
         ),
-        transforms.RandomRotation(degrees=10),
-        transforms.RandomPerspective(distortion_scale=0.2, p=0.3),
-        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
         transforms.ToTensor(),
         transforms.Normalize(mean=_MEAN, std=_STD),
     ])
@@ -57,19 +52,20 @@ def get_transforms(mode: str, frame_size: int = 224):
         of shape (3, frame_size, frame_size).
     """
     if mode == "train":
-        return transforms.Compose([
+        t = transforms.Compose([
             transforms.Resize((frame_size, frame_size)),
-            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomHorizontalFlip(p=0.3),
             transforms.ColorJitter(
-                brightness=0.2,
-                contrast=0.2,
-                saturation=0.2,
-                hue=0.05,
+                brightness=0.05,
+                contrast=0.05,
+                saturation=0.05,
+                hue=0.02,
             ),
-            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),
             transforms.ToTensor(),
             transforms.Normalize(mean=_MEAN, std=_STD),
         ])
+        print(f"[get_transforms] train pipeline: {t}")
+        return t
     else:
         # val and test: deterministic resize + normalise only
         return transforms.Compose([

@@ -37,6 +37,7 @@ class EAHNConfig:
     # ── Loss weights ──────────────────────────────────────────────────────────
     lambda1: float = 0.3   # L_exp weight (reduced 0.5→0.3 phase7: L_exp no longer stuck at ~3.0, leave room for L_cls to dominate early)
     lambda2: float = 0.2   # L_temp weight (raised 0.1→0.2 phase6: loosen temporal grip)
+    lambda_consistency: float = 0.3   # weight for consistency regularization loss (MSE between augmented and clean branch probs)
     alpha: float = 0.3     # entropy weight in weak supervision (raised 0.05→0.3 phase8: real sharpening pressure against the uniform fixed point)
     beta: float = 0.5      # TV weight in weak supervision
     gamma: float = 0.1     # gate decay rate in L_temp (was 10.0 — caused exp→0)
@@ -47,9 +48,9 @@ class EAHNConfig:
     max_per_class: int = 0         # if > 0, subsample train set to this many samples per class
 
     # ── Classification loss ───────────────────────────────────────────────────
-    cls_loss_type: str = "bce"   # "bce" | "focal"
-    focal_alpha: float = 1.0   # raised 0.25→1.0 phase8: remove gradient-magnitude shrinkage; WeightedRandomSampler handles balance
-    focal_gamma: float = 1.0  # lowered 1.5→1.0 phase6: further de-saturate logits for real class
+    cls_loss_type: str = "focal"   # "bce" | "focal" — phase 19.8: activate focal to up-weight hard fakes
+    focal_alpha: float = 0.65   # phase 19.8: up-weights fake class; >0.5 biases toward fake recall
+    focal_gamma: float = 2.0   # phase 19.8: standard focal exponent; focuses on hard examples
 
     # ── Training ──────────────────────────────────────────────────────────────
     epochs: int = 50
@@ -139,6 +140,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--lambda1", type=float, default=None)
     parser.add_argument("--lambda2", type=float, default=None)
+    parser.add_argument("--lambda_consistency", type=float, default=None,
+                        help="Weight for consistency regularization loss (default 0.3). "
+                             "MSE between augmented-branch and clean-branch probs.")
     parser.add_argument("--heatmap_samples", type=int, default=None)
     parser.add_argument("--num_frames", type=int, default=None)
     parser.add_argument("--backbone", type=str, default=None)
