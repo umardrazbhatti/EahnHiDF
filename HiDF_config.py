@@ -195,4 +195,15 @@ def parse_args() -> argparse.Namespace:
                         help="Run explanation metrics suite after evaluation.")
     parser.add_argument("--no_explanation_suite", dest="explanation_suite",
                         action="store_false")
+    parser.add_argument("--early_stop_patience", type=int, default=None,
+                        help="Epochs without improvement before early stopping (default 5).")
+    parser.add_argument("--early_stop_metric", type=str, default=None,
+                        help="Metric to monitor for early stopping (default val_balanced_accuracy).")
+    parser.add_argument("--early_stop_min_delta", type=float, default=None,
+                        help="Minimum improvement to count for early stopping (default 0.001).")
+    parser.add_argument("--save_heatmaps", dest="save_heatmaps",
+                        action="store_true", default=None,
+                        help="Save heatmap PNGs and MP4 overlays after evaluation.")
+    parser.add_argument("--no_save_heatmaps", dest="save_heatmaps",
+                        action="store_false")
     return parser.parse_args()
