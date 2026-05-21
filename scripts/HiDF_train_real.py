@@ -201,8 +201,14 @@ def main(config: EAHNConfig):
     # Also disable the heavy-aug branch entirely by setting minority_class to
     # a sentinel that never matches any real label:
     _clean_ds.minority_class = -1
+    # shuffle=True so the 200-sample cap sees a representative real+fake mix.
+    # HiDF samples are ordered [all real, all fake] — without shuffle the cap
+    # would only ever evaluate real samples, giving a spurious fake_acc=0.000.
+    _clean_gen = torch.Generator()
+    _clean_gen.manual_seed(42)
     _clean_loader = DataLoader(
         _clean_ds, batch_size=config.batch_size,
+        shuffle=True, generator=_clean_gen,
         num_workers=config.num_workers, collate_fn=deepfake_collate_fn,
         pin_memory=(config.device == "cuda"),
     )
