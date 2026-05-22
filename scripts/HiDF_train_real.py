@@ -270,7 +270,10 @@ def main(config: EAHNConfig):
                         blur_kernel=config.blur_kernel,
                         blur_sigma=config.blur_sigma,
                     )
-                    out_B       = model(x_b)
+                    # Pass B: no_grad to avoid storing activations for backward.
+                    # loss_faith is a monitoring metric; M_t trains via cls + sparsity gradients.
+                    with torch.no_grad():
+                        out_B = model(x_b)
                     loss_faith  = faithfulness_loss(logits_A, out_B.logit)
                     loss_sparse = sparsity_loss(M_t)
                 else:
