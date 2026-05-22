@@ -32,6 +32,35 @@ class EAHNOutput:
     attn_pool: torch.Tensor   # (B, d_model) — attention-weighted pooling for grad path
 
 
+class EarlyAttnHead(nn.Module):
+    """Phase 21: produces M_t from the CNN feature map BEFORE the transformer.
+
+    The map gates features so the transformer (and the classifier) cannot route
+    information around it.
+
+    Input  : feats  (B, T, C, H, W)   typically C=d_model, H=W=7
+    Output : M_t    (B, T, H, W)      softmax over H*W spatial cells per frame;
+                                      each (b, t) plane sums to 1
+    """
+    def __init__(self, d_model: int = 256, hidden: int = 64,
+                 init_temperature: float = 1.0):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Conv2d(d_model, hidden, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(hidden, 1, kernel_size=1),
+        )
+        self.log_tau = nn.Parameter(torch.zeros(1))   # learnable temperature; exp(0)=1.0
+
+    def forward(self, feats):  # feats: (B, T, C, H, W)
+        B, T, C, H, W = feats.shape
+        x = feats.reshape(B * T, C, H, W)
+        logits = self.proj(x).reshape(B, T, H * W)    # (B, T, H*W)
+        tau = self.log_tau.exp().clamp(min=0.3, max=3.0)
+        M = F.softmax(logits / tau, dim=-1)            # (B, T, H*W), sums to 1
+        return M.reshape(B, T, H, W)
+
+
 class EAHN(nn.Module):
     def __init__(self, config: EAHNConfig):
         super().__init__()
@@ -54,6 +83,14 @@ class EAHN(nn.Module):
         self.N      = N
         self.feat_h = self.spatial_stream.feat_h
         self.feat_w = self.spatial_stream.feat_w
+
+        # ── Early Attention Head (Phase 21) ───────────────────────────────────
+        self.early_attn = EarlyAttnHead(
+            d_model=d,
+            hidden=64,
+            init_temperature=1.0,
+        )
+        self.attn_floor = float(getattr(config, "attn_floor", 0.05))
 
         # ── Temporal Stream ───────────────────────────────────────────────────
         # max_seq_len = T*N + 1 (CLS token)
@@ -108,39 +145,55 @@ class EAHN(nn.Module):
         d = self.config.d_model
         C_low, Hl, Wl = low_feat.shape[1], low_feat.shape[2], low_feat.shape[3]
 
+        # Phase 21: reshape tokens → (B, T, d, h, w) for EarlyAttnHead conv ops
+        feats_5d = (
+            spatial_tokens                                               # (B*T, N, d)
+            .permute(0, 2, 1)                                            # (B*T, d, N)
+            .reshape(B * T, d, self.feat_h, self.feat_w)                 # (B*T, d, h, w)
+            .reshape(B, T, d, self.feat_h, self.feat_w)                  # (B, T, d, h, w)
+        )
+        M_t_early = self.early_attn(feats_5d)                           # (B, T, h, w)
+        gate = (M_t_early + self.attn_floor) / (1.0 + self.attn_floor)  # (B, T, h, w)
+        # Gate features (broadcast over channel dim), reshape back to token form
+        spatial_tokens = (
+            feats_5d * gate.unsqueeze(2)                                 # (B, T, d, h, w)
+        ).reshape(B * T, d, self.feat_h * self.feat_w).permute(0, 2, 1) # (B*T, N, d)
+
         spatial_tokens = spatial_tokens.view(B, T, N, d)
         low_level      = low_feat.view(B, T, C_low, Hl, Wl)
 
-        # Temporal stream — flatten T*N spatial tokens as the sequence
+        # Temporal stream — flatten T*N gated spatial tokens as the sequence
         Q, cls_out = self.temporal_stream(
             spatial_tokens.reshape(B, T * N, d)
         )                                                    # Q: (B, T*N, d)
 
-        Q = Q.reshape(B, T, N, d)
+        Q = Q.reshape(B, T, N, d)                           # post-transformer spatial tokens
 
-        # Cross-attention fusion → explanation maps + attention-pooled features
-        M_t, attn_pool = self.cross_attention(Q, spatial_tokens)  # (B, T, h, w), (B, d)
+        # Legacy cross-attention block retained; outputs discarded in Phase 21
+        _legacy_M_t, _legacy_attn_pool = self.cross_attention(Q, spatial_tokens)
 
-        # Upsample explanation maps to input resolution for visualisation / loss
-        M_t_up = F.interpolate(
-            M_t.reshape(B * T, 1, self.feat_h, self.feat_w),
+        # Phase 21 Amendment 1: attn_pool from early M_t × post-transformer tokens
+        M_flat = M_t_early.reshape(B, T, N)                             # (B, T, N)
+        attn_pool_per_frame = (Q * M_flat.unsqueeze(-1)).sum(dim=2)     # (B, T, d)
+        attn_pool = attn_pool_per_frame.mean(dim=1)                     # (B, d)
+
+        # Phase 21 Amendment 2: upsample early M_t to input resolution
+        M_t_up_early = F.interpolate(
+            M_t_early.reshape(B * T, 1, self.feat_h, self.feat_w),
             size=(H, W),
             mode="bilinear",
             align_corners=False,
         ).reshape(B, T, H, W)                               # (B, T, H, W)
 
-        # Phase 20: force classifier to read attn_pool only. This makes M_t causal
-        # for the prediction — gradient on L_cls flows directly through cross-
-        # attention weights into M_t, eliminating the side-branch decoration
-        # problem. cls_out is still computed (needed for diagnostics) but does not
-        # gate the prediction.
+        # Classifier reads early M_t-derived attn_pool (Amendment 1)
         final_feat = attn_pool                              # (B, d)
         logit = self.classifier(final_feat).squeeze(-1)     # (B,)
         prob  = torch.sigmoid(logit)
 
         return EAHNOutput(
             logit=logit, prob=prob,
-            M_t=M_t, M_t_up=M_t_up,
+            M_t=M_t_early,       # Phase 21: early M_t (not legacy cross-attn)
+            M_t_up=M_t_up_early, # Phase 21: upsample of early M_t
             S=spatial_tokens, low_level=low_level,
-            attn_pool=attn_pool,
+            attn_pool=attn_pool, # Phase 21: early M_t × post-transformer tokens
         )

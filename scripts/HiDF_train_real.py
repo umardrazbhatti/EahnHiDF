@@ -14,6 +14,7 @@ Phase 6 changes vs phase 5d:
 import os
 import csv as _csv
 import dataclasses as _dataclasses
+import json
 import math
 import torch
 import torch.nn.functional as F
@@ -27,11 +28,23 @@ from data.HiDF_datasets import DeepfakeDataset
 from data.HiDF_collate import deepfake_collate_fn
 from models.HiDF_eahn import EAHN
 from losses.HiDF_classification import build_classification_loss
-from losses.HiDF_explanation import ExplanationLoss
+from losses.HiDF_explanation import (
+    ExplanationLoss,
+    build_bottlenecked_input,
+    faithfulness_loss,
+    sparsity_loss,
+)
 from losses.HiDF_temporal import TemporalConsistencyLoss
 from metrics.HiDF_detection import DetectionMetrics
 from utils.HiDF_checkpointing import save_checkpoint, load_checkpoint
 from utils.HiDF_logging_utils import Logger
+
+
+def _faith_warmup(epoch: int, warmup_epochs: int, target: float) -> float:
+    """Linear ramp from 0 (epoch 0) to target (epoch warmup_epochs)."""
+    if warmup_epochs <= 0:
+        return target
+    return target * min(1.0, float(epoch) / float(warmup_epochs))
 
 
 def main(config: EAHNConfig):
@@ -167,8 +180,9 @@ def main(config: EAHNConfig):
     # ── CHANGE 12a: epoch-level training history ───────────────────────────────
     history = {
         "epoch":               [],
-        "train_total":         [], "train_cls":  [],
-        "train_exp":           [], "train_temp": [],
+        "train_total":         [], "train_cls":    [],
+        "train_exp":           [], "train_temp":   [],
+        "train_faith":         [], "train_sparse": [],
         "val_auc_roc":         [], "val_balanced_acc":      [],
         "val_real_acc":        [], "val_fake_acc":          [],
         "val_inter_sample_cos": [], "val_mt_std":           [],
@@ -225,25 +239,58 @@ def main(config: EAHNConfig):
         optimizer.zero_grad(set_to_none=True)
 
         # ── CHANGE 12b: per-epoch loss accumulator ────────────────────────────
-        epoch_acc = {"total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0, "n": 0}
+        epoch_acc = {
+            "total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0,
+            "faith": 0.0, "sparse": 0.0, "n": 0,
+        }
 
         # ── CHANGE 3: rolling log accumulator ────────────────────────────────
         LOG_EVERY = 200
-        run = {"total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0, "cons": 0.0, "n": 0}
+        run = {
+            "total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0,
+            "cons": 0.0, "faith": 0.0, "sparse": 0.0, "n": 0,
+        }
 
         for batch_idx, batch in enumerate(train_loader):
             frames   = batch["frames"].to(device, non_blocking=True)
             labels   = batch["label"].to(device, non_blocking=True)
 
             with autocast(_dev_str, enabled=_use_amp, dtype=_amp_dtype):
-                out      = model(frames)
-                l_cls    = cls_loss_fn(out.logit, labels)
-                exp_out  = exp_loss_fn(out.M_t)
-                l_exp    = exp_out.loss
-                l_temp   = temp_loss_fn(out.M_t, out.low_level)
+                # ── Phase 21 two-pass forward ─────────────────────────────────
+                out_A    = model(frames)
+                logits_A = out_A.logit
+                M_t      = out_A.M_t                        # early M_t (B, T, h, w)
+                loss_cls = cls_loss_fn(logits_A, labels)
+
+                if config.phase21_enabled:
+                    x_b = build_bottlenecked_input(
+                        frames, M_t,
+                        blur_kernel=config.blur_kernel,
+                        blur_sigma=config.blur_sigma,
+                    )
+                    out_B       = model(x_b)
+                    loss_faith  = faithfulness_loss(logits_A, out_B.logit)
+                    loss_sparse = sparsity_loss(M_t)
+                else:
+                    loss_faith  = torch.zeros((), device=frames.device)
+                    loss_sparse = torch.zeros((), device=frames.device)
+
+                exp_out = exp_loss_fn(M_t)
+                l_exp   = exp_out.loss
+                l_temp  = temp_loss_fn(M_t, out_A.low_level)
+
                 _global_step = (epoch - 1) * len(train_loader) + batch_idx
                 _lambda1_eff = config.lambda1 * min(1.0, _global_step / 200.0)
-                l_total  = l_cls + _lambda1_eff * l_exp + config.lambda2 * l_temp
+                lam_faith_eff = _faith_warmup(
+                    epoch, config.faith_warmup_epochs, config.lambda_faith
+                )
+
+                l_total = (loss_cls
+                           + lam_faith_eff        * loss_faith
+                           + config.lambda_sparse  * loss_sparse
+                           + _lambda1_eff          * l_exp
+                           + config.lambda2        * l_temp)
+                # ─────────────────────────────────────────────────────────────
 
                 # Consistency regularization — penalise augmented branch for deviating
                 # from clean-branch prediction.  Clean branch runs under no_grad so
@@ -254,13 +301,13 @@ def main(config: EAHNConfig):
                     with torch.no_grad():
                         _out_clean = model(_frames_clean)
                     _probs_clean = _out_clean.prob.detach()
-                    _probs_aug   = out.prob
+                    _probs_aug   = out_A.prob
                     l_consistency = F.mse_loss(_probs_aug, _probs_clean)
                     l_total = l_total + _lambda_cons * l_consistency
                 else:
                     l_consistency = torch.tensor(0.0)
 
-                loss     = l_total / config.grad_accum_steps
+                loss = l_total / config.grad_accum_steps
 
             scaler.scale(loss).backward()
 
@@ -273,9 +320,10 @@ def main(config: EAHNConfig):
 
             # ── First-batch diagnostics (first epoch of this session only) ──────
             if epoch == start_epoch + 1 and batch_idx == 0:
-                print(f"[DIAG] M_t mean={out.M_t.mean():.4f} std={out.M_t.std():.4f}")
-                print(f"[DIAG] L_cls={l_cls.item():.6f} L_exp={l_exp.item():.6f} "
-                      f"L_temp={l_temp.item():.6f}")
+                print(f"[DIAG] M_t mean={out_A.M_t.mean():.4f} std={out_A.M_t.std():.4f}")
+                print(f"[DIAG] L_cls={loss_cls.item():.6f} L_exp={l_exp.item():.6f} "
+                      f"L_temp={l_temp.item():.6f}  L_faith={loss_faith.item():.6f} "
+                      f"L_sparse={loss_sparse.item():.6f}")
                 print(f"[DIAG] attn_temp=exp({model.cross_attention.log_temp.item():.3f})"
                       f"={torch.exp(model.cross_attention.log_temp).item():.3f}")
 
@@ -286,18 +334,24 @@ def main(config: EAHNConfig):
                 print(f"[BatchBalance] step={batch_idx+1} real={n_real} fake={n_fake}")
 
             # ── Accumulate losses ─────────────────────────────────────────────
-            _lt = l_total.item()
-            _lc = l_cls.item()
-            _le = l_exp.item()
-            _lp = l_temp.item()
+            _lt    = l_total.item()
+            _lc    = loss_cls.item()
+            _le    = l_exp.item()
+            _lp    = l_temp.item()
             _lcons = l_consistency.item()
+            _lf    = loss_faith.item()
+            _ls    = loss_sparse.item()
 
-            run["total"] += _lt;  run["cls"] += _lc
-            run["exp"]   += _le;  run["temp"] += _lp
-            run["cons"]  += _lcons;  run["n"] += 1
+            run["total"]  += _lt;  run["cls"]    += _lc
+            run["exp"]    += _le;  run["temp"]   += _lp
+            run["cons"]   += _lcons
+            run["faith"]  += _lf;  run["sparse"] += _ls
+            run["n"]      += 1
 
-            epoch_acc["total"] += _lt;  epoch_acc["cls"] += _lc
-            epoch_acc["exp"]   += _le;  epoch_acc["temp"] += _lp;  epoch_acc["n"] += 1
+            epoch_acc["total"]  += _lt;  epoch_acc["cls"]    += _lc
+            epoch_acc["exp"]    += _le;  epoch_acc["temp"]   += _lp
+            epoch_acc["faith"]  += _lf;  epoch_acc["sparse"] += _ls
+            epoch_acc["n"]      += 1
 
             # ── CHANGE 3: rolling log (every LOG_EVERY batches) ──────────────
             if (batch_idx + 1) % LOG_EVERY == 0 or (batch_idx + 1) == total_batches:
@@ -307,6 +361,7 @@ def main(config: EAHNConfig):
                     f"[E{epoch:>{epoch_w}} {batch_idx+1:4d}/{total_batches}] "
                     f"total={run['total']/n:.4f}  cls={run['cls']/n:.4f}  "
                     f"exp={run['exp']/n:.4f}  temp={run['temp']/n:.4f}  "
+                    f"faith={run['faith']/n:.4f}  sparse={run['sparse']/n:.4f}  "
                     f"cons={run['cons']/n:.4f}  "
                     f"tau={_tau:.2f}  sim={exp_out.inter_sample_sim:.2f}"
                 )
@@ -317,10 +372,12 @@ def main(config: EAHNConfig):
         # ── CHANGE 12b cont.: store epoch-average train losses ─────────────────
         n = max(epoch_acc["n"], 1)
         history["epoch"].append(epoch)   # 1-indexed epoch number
-        history["train_total"].append(epoch_acc["total"] / n)
-        history["train_cls"].append(epoch_acc["cls"]   / n)
-        history["train_exp"].append(epoch_acc["exp"]   / n)
-        history["train_temp"].append(epoch_acc["temp"] / n)
+        history["train_total"].append(epoch_acc["total"]  / n)
+        history["train_cls"].append(epoch_acc["cls"]      / n)
+        history["train_exp"].append(epoch_acc["exp"]      / n)
+        history["train_temp"].append(epoch_acc["temp"]    / n)
+        history["train_faith"].append(epoch_acc["faith"]  / n)
+        history["train_sparse"].append(epoch_acc["sparse"] / n)
 
         # ── Validation ────────────────────────────────────────────────────────
         model.eval()
@@ -483,6 +540,50 @@ def main(config: EAHNConfig):
                         print(f"[EarlyStopping] Best weights restored from {ckpt_path}")
                     _es_triggered = True
                     break   # exit the epoch for-loop
+
+        # ── Phase 21 snapshot every N epochs ──────────────────────────────────
+        if getattr(config, "phase21_enabled", True) and \
+                ((epoch + 1) % config.snapshot_every == 0):
+            snap_dir = Path(config.output_dir) / "snapshots" / f"epoch_{epoch+1:02d}"
+            snap_dir.mkdir(parents=True, exist_ok=True)
+
+            torch.save(
+                {"epoch": epoch + 1, "model_state_dict": model.state_dict()},
+                snap_dir / "model.pth",
+            )
+
+            with torch.no_grad():
+                mt_stats = {
+                    "mean": float(M_t.mean().item()),
+                    "std":  float(M_t.std().item()),
+                    "peak_per_frame_mean": float(M_t.amax(dim=(-2, -1)).mean().item()),
+                    "min": float(M_t.min().item()),
+                    "max": float(M_t.max().item()),
+                }
+
+            def _avg(key):
+                _n = max(1, epoch_acc.get("n", 1))
+                return float(epoch_acc.get(key, 0.0)) / _n
+
+            snap_meta = {
+                "epoch":             epoch + 1,
+                "train_loss_cls":    _avg("cls"),
+                "train_loss_faith":  _avg("faith"),
+                "train_loss_sparse": _avg("sparse"),
+                "train_loss_exp":    _avg("exp"),
+                "train_loss_temp":   _avg("temp"),
+                "train_loss_total":  _avg("total"),
+                "lam_faith_eff":     float(lam_faith_eff),
+                "val_auc_roc":       float(metrics.get("auc_roc", -1.0)),
+                "val_balanced_acc":  float(metrics.get("balanced_accuracy", -1.0)),
+                "val_real_acc":      float(metrics.get("real_accuracy", -1.0)),
+                "val_fake_acc":      float(metrics.get("fake_accuracy", -1.0)),
+                "M_t_stats_last_batch": mt_stats,
+            }
+            with open(snap_dir / "meta.json", "w") as _sf:
+                json.dump(snap_meta, _sf, indent=2)
+            print(f"[Phase21 snapshot] saved → {snap_dir}")
+        # ──────────────────────────────────────────────────────────────────────
 
     logger.close()
     _stop_reason = "early stopping" if _es_triggered else "epoch limit"

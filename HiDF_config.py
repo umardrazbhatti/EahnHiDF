@@ -35,7 +35,7 @@ class EAHNConfig:
     dropout: float = 0.1
 
     # ── Loss weights ──────────────────────────────────────────────────────────
-    lambda1: float = 0.1   # L_exp weight (reduced 0.3→0.1 phase20: L_cls now flows through M_t, so L_exp pressure can ease)
+    lambda1: float = 0.02   # L_exp weight (reduced 0.3→0.1 phase20, 0.1→0.02 phase21: L_sparse takes over sparsity pressure)
     lambda2: float = 0.2   # L_temp weight (raised 0.1→0.2 phase6: loosen temporal grip)
     lambda_consistency: float = 0.3   # weight for consistency regularization loss (MSE between augmented and clean branch probs)
     alpha: float = 0.05    # entropy weight in weak supervision (phase20: alpha=0.3 was driving M_t to one-hot per frame; lowering frees M_t to form face-sized blobs)
@@ -85,6 +85,16 @@ class EAHNConfig:
     early_stop_patience:  int   = 5                         # epochs without improvement before halt
     early_stop_metric:    str   = "val_balanced_accuracy"   # metric to monitor
     early_stop_min_delta: float = 0.001                     # minimum improvement to count
+
+    # ── Phase 21: faithful attention bottleneck ───────────────────────────────
+    phase21_enabled:      bool  = True    # master switch; False reverts to Phase 20 behaviour
+    lambda_faith:         float = 0.3     # weight for faithfulness KL loss
+    lambda_sparse:        float = 0.05    # weight for sparsity (negative peak) loss
+    faith_warmup_epochs:  int   = 3       # linear ramp from 0 → lambda_faith over N epochs
+    attn_floor:           float = 0.05    # gate floor in EarlyAttnHead
+    blur_kernel:          int   = 21      # Gaussian kernel size for bottlenecked input
+    blur_sigma:           float = 10.0    # Gaussian sigma for bottlenecked input
+    snapshot_every:       int   = 2       # save snapshot every N epochs
 
     # ── Device ────────────────────────────────────────────────────────────────
     device: str = "auto"
@@ -206,4 +216,23 @@ def parse_args() -> argparse.Namespace:
                         help="Save heatmap PNGs and MP4 overlays after evaluation.")
     parser.add_argument("--no_save_heatmaps", dest="save_heatmaps",
                         action="store_false")
+    parser.add_argument("--phase21_enabled", dest="phase21_enabled",
+                        action="store_true", default=None,
+                        help="Enable Phase 21 faithful attention bottleneck (default True).")
+    parser.add_argument("--no_phase21_enabled", dest="phase21_enabled",
+                        action="store_false")
+    parser.add_argument("--lambda_faith", type=float, default=None,
+                        help="Weight for Phase 21 faithfulness KL loss (default 0.3).")
+    parser.add_argument("--lambda_sparse", type=float, default=None,
+                        help="Weight for Phase 21 sparsity (negative peak) loss (default 0.05).")
+    parser.add_argument("--faith_warmup_epochs", type=int, default=None,
+                        help="Epochs to linearly ramp lambda_faith from 0 (default 3).")
+    parser.add_argument("--attn_floor", type=float, default=None,
+                        help="Gate floor for EarlyAttnHead (default 0.05).")
+    parser.add_argument("--blur_kernel", type=int, default=None,
+                        help="Gaussian kernel size for bottlenecked input (default 21).")
+    parser.add_argument("--blur_sigma", type=float, default=None,
+                        help="Gaussian sigma for bottlenecked input (default 10.0).")
+    parser.add_argument("--snapshot_every", type=int, default=None,
+                        help="Save Phase 21 snapshot every N epochs (default 2).")
     return parser.parse_args()

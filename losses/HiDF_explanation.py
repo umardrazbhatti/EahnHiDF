@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Optional
+from torchvision.transforms import functional as TF
 
 
 @dataclass
@@ -101,3 +102,72 @@ class ExplanationLoss(nn.Module):
             l_div=float(l_div_tensor.item()),
             inter_sample_sim=inter_sample_sim,
         )
+
+
+# ── Phase 21 utilities ────────────────────────────────────────────────────────
+
+def _gaussian_blur_5d(x: torch.Tensor,
+                      kernel_size: int = 21,
+                      sigma: float = 10.0) -> torch.Tensor:
+    """Gaussian blur over a 5D video tensor.
+    x: (B, T, C, H, W) → blurred same shape.
+    """
+    B, T, C, H, W = x.shape
+    x_flat = x.reshape(B * T, C, H, W)
+    blurred = TF.gaussian_blur(
+        x_flat,
+        kernel_size=[kernel_size, kernel_size],
+        sigma=[sigma, sigma],
+    )
+    return blurred.reshape(B, T, C, H, W)
+
+
+def build_bottlenecked_input(x: torch.Tensor,
+                              M_t: torch.Tensor,
+                              blur_kernel: int = 21,
+                              blur_sigma: float = 10.0) -> torch.Tensor:
+    """Construct an M_t-gated input at image resolution.
+
+    x   : (B, T, 3, H, W)
+    M_t : (B, T, h, w)     softmax over h*w cells per frame (grad preserved)
+
+    Returns x_b (same shape as x):
+        x_b = M_norm * x + (1 - M_norm) * blur(x)
+    where M_norm is M_t upsampled to (H, W) and rescaled per frame so its
+    peak cell maps to 1.0 (raw softmax values are ~1/49, so without this
+    rescaling x_b would be nearly all blur).
+    """
+    B, T, C, H, W = x.shape
+    M_up = F.interpolate(
+        M_t.reshape(B * T, 1, M_t.shape[-2], M_t.shape[-1]),
+        size=(H, W), mode="bilinear", align_corners=False,
+    ).reshape(B, T, 1, H, W)
+
+    M_peak = M_up.amax(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
+    M_norm = (M_up / M_peak).clamp(0.0, 1.0)           # (B, T, 1, H, W)
+
+    with torch.no_grad():
+        x_blur = _gaussian_blur_5d(x.detach(), blur_kernel, blur_sigma)
+
+    return M_norm * x + (1.0 - M_norm) * x_blur
+
+
+def faithfulness_loss(logits_A: torch.Tensor,
+                       logits_B: torch.Tensor) -> torch.Tensor:
+    """One-way KL from sg(logits_A) to logits_B for binary logits.
+
+    sg(logits_A) is treated as the target; gradient flows only through
+    logits_B (and, via x_b, back into M_t and EarlyAttnHead).
+    """
+    pA = torch.sigmoid(logits_A.detach()).clamp(1e-6, 1.0 - 1e-6)
+    pB = torch.sigmoid(logits_B).clamp(1e-6, 1.0 - 1e-6)
+    kl = (pA * (pA.log() - pB.log())
+          + (1.0 - pA) * ((1.0 - pA).log() - (1.0 - pB).log()))
+    return kl.mean()
+
+
+def sparsity_loss(M_t: torch.Tensor) -> torch.Tensor:
+    """Negative mean peak-energy. Minimised when each (b, t) frame has a
+    high peak cell. Use a small positive weight (e.g. 0.05) in training.
+    """
+    return -M_t.amax(dim=(-2, -1)).mean()
