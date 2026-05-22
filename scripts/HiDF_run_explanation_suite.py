@@ -89,12 +89,22 @@ def run_explanation_suite(model, test_loader, config, output_path: Path) -> dict
     print("[ExplanationSuite] Computing deletion/insertion AUC...")
     del_ins = {"deletion_auc": 0.0, "insertion_auc": 0.0}
     try:
-        sample_idx    = int(indices[0])
-        frames_sample = all_frames[sample_idx:sample_idx+1]
-        sal_sample    = all_M_t_up[sample_idx:sample_idx+1].numpy()
+        # Phase 20.1: use 8 samples instead of 1 for statistically reliable
+        # deletion/insertion AUC. Baseline (Xception+GradCAM) used 40 frames;
+        # we use 8 videos × 16 frames = 128 effective frames. T4 memory budget
+        # allows N=8 comfortably (~4 GB peak); larger N risks OOM during the
+        # batched forward pass inside deletion_insertion_auc.
+        N_DEL_INS = min(8, N)
+        rng_di = np.random.default_rng(42)
+        di_indices = rng_di.choice(N, size=N_DEL_INS, replace=False)
+        frames_sample = all_frames[di_indices]              # (N_DEL_INS, T, C, H, W)
+        sal_sample    = all_M_t_up[di_indices].numpy()      # (N_DEL_INS, T, H, W)
         del_ins = ExplanationMetrics.deletion_insertion_auc(
             model, frames_sample, sal_sample, steps=10
         )
+        print(f"  [del/ins AUC on N={N_DEL_INS} samples]  "
+              f"del={del_ins.get('deletion_auc', 0):.4f}  "
+              f"ins={del_ins.get('insertion_auc', 0):.4f}")
     except Exception as e:
         print(f"  [del/ins AUC skipped: {e}]")
 
