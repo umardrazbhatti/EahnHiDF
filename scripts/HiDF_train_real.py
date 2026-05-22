@@ -370,7 +370,7 @@ def main(config: EAHNConfig):
                     f"cons={run['cons']/n:.4f}  "
                     f"tau={_tau:.2f}  sim={exp_out.inter_sample_sim:.2f}"
                 )
-                run = {"total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0, "cons": 0.0, "n": 0}
+                run = {"total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0, "cons": 0.0, "faith": 0.0, "sparse": 0.0, "n": 0}
 
         scheduler.step()
 
