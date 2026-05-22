@@ -35,13 +35,13 @@ class EAHNConfig:
     dropout: float = 0.1
 
     # ── Loss weights ──────────────────────────────────────────────────────────
-    lambda1: float = 0.3   # L_exp weight (reduced 0.5→0.3 phase7: L_exp no longer stuck at ~3.0, leave room for L_cls to dominate early)
+    lambda1: float = 0.1   # L_exp weight (reduced 0.3→0.1 phase20: L_cls now flows through M_t, so L_exp pressure can ease)
     lambda2: float = 0.2   # L_temp weight (raised 0.1→0.2 phase6: loosen temporal grip)
     lambda_consistency: float = 0.3   # weight for consistency regularization loss (MSE between augmented and clean branch probs)
-    alpha: float = 0.3     # entropy weight in weak supervision (raised 0.05→0.3 phase8: real sharpening pressure against the uniform fixed point)
+    alpha: float = 0.05    # entropy weight in weak supervision (phase20: alpha=0.3 was driving M_t to one-hot per frame; lowering frees M_t to form face-sized blobs)
     beta: float = 0.5      # TV weight in weak supervision
     gamma: float = 0.1     # gate decay rate in L_temp (was 10.0 — caused exp→0)
-    attn_temp_init: float = 0.0    # τ = exp(0) = 1.0 (was log(4.0)=1.386 → τ=4, over-smoothed attention from init; phase8)
+    attn_temp_init: float = 0.7    # start at τ=exp(0.7)≈2.0 (smoother softmax); log_temp remains learnable, this is initialization only (phase20)
     attn_diversity_weight: float = 5.0  # weight for JS diversity penalty in L_exp (raised 3.0→5.0 phase8: JS has smaller scale than cosine)
     cls_dropout_p: float = 0.0    # phase7: disabled — attn_pool now informative; joint gradient on every step
     label_smoothing: float = 0.05   # Task 3.2: maps 0→0.05, 1→0.95 to prevent logit saturation at 0.000/1.000

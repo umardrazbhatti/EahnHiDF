@@ -58,31 +58,54 @@ class ExplanationMetrics:
         B, T, C, H, W = frames.shape
         total_pixels  = H * W
 
+        import torch.nn.functional as _F
+
+        # Phase 20: switch to Gaussian-blur fill (matches baseline benchmark
+        # protocol). Zero-fill in normalized space is technically ImageNet mean,
+        # but blur preserves low-frequency content (face shape, lighting) while
+        # removing high-frequency content (manipulation cues), giving a much
+        # cleaner faithfulness signal.
+        def _gauss_blur(x, k=21, sigma=10.0):
+            # x: (B, T, C, H, W)
+            Bx, Tx, Cx, Hx, Wx = x.shape
+            flat = x.reshape(Bx * Tx, Cx, Hx, Wx)
+            ax = torch.arange(k, dtype=torch.float32, device=x.device) - (k - 1) / 2
+            g = torch.exp(-(ax ** 2) / (2 * sigma * sigma))
+            g = g / g.sum()
+            kx = g.view(1, 1, 1, k).expand(Cx, 1, 1, k)
+            ky = g.view(1, 1, k, 1).expand(Cx, 1, k, 1)
+            pad = k // 2
+            blurred = _F.conv2d(flat, kx, padding=(0, pad), groups=Cx)
+            blurred = _F.conv2d(blurred, ky, padding=(pad, 0), groups=Cx)
+            return blurred.reshape(Bx, Tx, Cx, Hx, Wx)
+
         with torch.no_grad():
             baseline_logit = model(frames.to(device)).prob.mean().item()
+            blurred_full = _gauss_blur(frames)            # (B, T, C, H, W)
 
         del_scores = []
         ins_scores = []
 
         # Use mean explanation over time
-        sal = saliency.mean(1)   # (B, H, W) or just use first frame
+        sal = saliency.mean(1)   # (B, H, W)
 
         for step in range(steps + 1):
             frac = step / steps
             k    = max(1, int(frac * total_pixels))
 
-            # Deletion: mask out top-k salient pixels
+            # Deletion: replace top-k pixels with blurred version
+            # Insertion: start blurred, reveal top-k from original
             del_frames = frames.clone()
-            ins_frames = torch.zeros_like(frames)
+            ins_frames = blurred_full.clone()
 
             for b in range(B):
-                flat_sal = sal[b].reshape(-1)                         # np.ndarray
-                top_k_idx = np.argsort(flat_sal)[-k:].copy()          # top-k, contiguous
-                mask     = np.zeros(H * W, dtype=bool)
+                flat_sal = sal[b].reshape(-1)
+                top_k_idx = np.argsort(flat_sal)[-k:].copy()
+                mask = np.zeros(H * W, dtype=bool)
                 mask[top_k_idx] = True
-                mask_2d  = mask.reshape(H, W)
+                mask_2d = mask.reshape(H, W)
 
-                del_frames[b, :, :, mask_2d] = 0.0
+                del_frames[b, :, :, mask_2d] = blurred_full[b, :, :, mask_2d]
                 ins_frames[b, :, :, mask_2d] = frames[b, :, :, mask_2d]
 
             with torch.no_grad():

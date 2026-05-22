@@ -129,12 +129,12 @@ class EAHN(nn.Module):
             align_corners=False,
         ).reshape(B, T, H, W)                               # (B, T, H, W)
 
-        # Stochastic CLS_out dropout: during training, randomly force classification
-        # through the attention branch only, ensuring gradient pressure flows to M_t.
-        if self.training and torch.rand(1).item() < self.config.cls_dropout_p:
-            final_feat = attn_pool
-        else:
-            final_feat = cls_out + attn_pool                # (B, d)
+        # Phase 20: force classifier to read attn_pool only. This makes M_t causal
+        # for the prediction — gradient on L_cls flows directly through cross-
+        # attention weights into M_t, eliminating the side-branch decoration
+        # problem. cls_out is still computed (needed for diagnostics) but does not
+        # gate the prediction.
+        final_feat = attn_pool                              # (B, d)
         logit = self.classifier(final_feat).squeeze(-1)     # (B,)
         prob  = torch.sigmoid(logit)
 
