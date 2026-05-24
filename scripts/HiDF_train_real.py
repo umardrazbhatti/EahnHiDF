@@ -180,6 +180,10 @@ def main(config: EAHNConfig):
     peak_spread_fn = PeakSpreadLoss(tau_soft=1.0)
     print(f"[PeakSpreadLoss] lambda_peak_spread={_lambda_peak_spread}")
 
+    # v3: sharpness loss — maximises within-map std to lift mt_std diagnostic
+    _lambda_sharp = float(getattr(config, "lambda_sharp", 0.5))
+    print(f"[SharpnessLoss] lambda_sharp={_lambda_sharp}")
+
     ckpt_path = os.path.join(config.output_dir, f"eahn_{config.dataset_name}_best.pth")
 
     # ── History ───────────────────────────────────────────────────────────────
@@ -189,6 +193,7 @@ def main(config: EAHNConfig):
         "train_exp":           [], "train_temp":   [],
         "train_faith":         [], "train_sparse": [],
         "train_peak_spread":   [],                      # v2: new term
+        "train_sharp":         [],                      # v3: sharpness loss
         "val_auc_roc":         [], "val_balanced_acc":      [],
         "val_real_acc":        [], "val_fake_acc":          [],
         "val_inter_sample_cos": [], "val_mt_std":           [],
@@ -235,14 +240,14 @@ def main(config: EAHNConfig):
 
         epoch_acc = {
             "total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0,
-            "faith": 0.0, "sparse": 0.0, "peak_spread": 0.0, "n": 0,
+            "faith": 0.0, "sparse": 0.0, "peak_spread": 0.0, "sharp": 0.0, "n": 0,
         }
 
         LOG_EVERY = 200
         run = {
             "total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0,
             "cons": 0.0, "faith": 0.0, "sparse": 0.0,
-            "peak_spread": 0.0, "n": 0,
+            "peak_spread": 0.0, "sharp": 0.0, "n": 0,
         }
 
         for batch_idx, batch in enumerate(train_loader):
@@ -290,6 +295,13 @@ def main(config: EAHNConfig):
                 # This directly attacks peak_mode_share > 0.30.
                 l_peak_spread = peak_spread_fn(M_t)
 
+                # ── Sharpness loss (v3): maximises std within each M_t map ────
+                # mt_std diagnostic = mean over batch of per-sample map std.
+                # This directly maximises that quantity. Unlike sparsity_loss
+                # (-mean_peak) this works even when the peak is in the wrong place.
+                B_s, T_s, h_s, w_s = M_t.shape
+                loss_sharp = -M_t.reshape(B_s * T_s, h_s * w_s).std(dim=1).mean()
+
                 # ── Loss weighting ────────────────────────────────────────────
                 _global_step = (epoch - 1) * len(train_loader) + batch_idx
                 _lambda1_eff = config.lambda1 * min(1.0, _global_step / 200.0)
@@ -302,7 +314,8 @@ def main(config: EAHNConfig):
                            + config.lambda_sparse    * loss_sparse
                            + _lambda1_eff            * l_exp
                            + config.lambda2          * l_temp
-                           + _lambda_peak_spread     * l_peak_spread)
+                           + _lambda_peak_spread     * l_peak_spread
+                           + _lambda_sharp           * loss_sharp)
 
                 # ── Consistency regularisation (unchanged) ────────────────────
                 _lambda_cons = float(getattr(config, "lambda_consistency", 0.0))
@@ -337,6 +350,7 @@ def main(config: EAHNConfig):
                       f"L_peak_spread={l_peak_spread.item():.6f}")
                 print(f"[DIAG] lam_faith_eff={lam_faith_eff:.4f}  "
                       f"lambda_peak_spread={_lambda_peak_spread}  "
+                      f"lambda_sharp={_lambda_sharp}  "
                       f"lambda_sparse={config.lambda_sparse}")
                 print(f"[DIAG] attn_temp=exp({model.cross_attention.log_temp.item():.3f})"
                       f"={torch.exp(model.cross_attention.log_temp).item():.3f}")
@@ -356,17 +370,19 @@ def main(config: EAHNConfig):
             _lf  = loss_faith.item()
             _ls  = loss_sparse.item()
             _lps = l_peak_spread.item()
+            _lsh = loss_sharp.item()
 
             run["total"]       += _lt;  run["cls"]    += _lc
             run["exp"]         += _le;  run["temp"]   += _lp
             run["cons"]        += _lco
             run["faith"]       += _lf;  run["sparse"] += _ls
-            run["peak_spread"] += _lps; run["n"]      += 1
+            run["peak_spread"] += _lps; run["sharp"]  += _lsh; run["n"] += 1
 
             epoch_acc["total"]       += _lt;  epoch_acc["cls"]    += _lc
             epoch_acc["exp"]         += _le;  epoch_acc["temp"]   += _lp
             epoch_acc["faith"]       += _lf;  epoch_acc["sparse"] += _ls
-            epoch_acc["peak_spread"] += _lps; epoch_acc["n"]      += 1
+            epoch_acc["peak_spread"] += _lps; epoch_acc["sharp"]  += _lsh
+            epoch_acc["n"]           += 1
 
             # ── Rolling log ───────────────────────────────────────────────────
             if (batch_idx + 1) % LOG_EVERY == 0 or (batch_idx + 1) == total_batches:
@@ -377,6 +393,7 @@ def main(config: EAHNConfig):
                     f"total={run['total']/n:.4f}  cls={run['cls']/n:.4f}  "
                     f"exp={run['exp']/n:.4f}  temp={run['temp']/n:.4f}  "
                     f"faith={run['faith']/n:.4f}  sparse={run['sparse']/n:.4f}  "
+                    f"sharp={run['sharp']/n:.4f}  "
                     f"peak_spread={run['peak_spread']/n:.4f}  "
                     f"cons={run['cons']/n:.4f}  "
                     f"tau={_tau:.2f}  sim={exp_out.inter_sample_sim:.2f}"
@@ -384,7 +401,7 @@ def main(config: EAHNConfig):
                 run = {
                     "total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0,
                     "cons": 0.0, "faith": 0.0, "sparse": 0.0,
-                    "peak_spread": 0.0, "n": 0,
+                    "peak_spread": 0.0, "sharp": 0.0, "n": 0,
                 }
 
         scheduler.step()
@@ -399,6 +416,7 @@ def main(config: EAHNConfig):
         history["train_faith"].append(epoch_acc["faith"]       / n)
         history["train_sparse"].append(epoch_acc["sparse"]     / n)
         history["train_peak_spread"].append(epoch_acc["peak_spread"] / n)
+        history["train_sharp"].append(epoch_acc["sharp"] / n)
 
         # ── Validation ────────────────────────────────────────────────────────
         model.eval()
@@ -428,26 +446,41 @@ def main(config: EAHNConfig):
             f"balanced_acc={_val_bal_acc:.3f}"
         )
 
-        # ── Attention-diversity diagnostic (v2: full PASS/FAIL + peak_mode_share) ──
+        # ── Attention-diversity diagnostic (v3: full val-set for meaningful peak_mode_share) ──
+        # peak_mode_share is meaningless at B=2 (always 0.5 or 1.0).
+        # Fix: accumulate M_t peaks across the ENTIRE val loader (~419 samples).
+        # mt_std and cosine are also accumulated for consistency.
+        _all_mt_flat   = []
+        _all_mt_peaks  = []
         with torch.no_grad():
-            diag_batch  = next(iter(val_loader))
-            diag_frames = diag_batch["frames"].to(device)
-            diag_out    = model(diag_frames)
-            mt          = diag_out.M_t.mean(dim=1)          # (B, h, w)
-            mt_flat     = mt.reshape(mt.size(0), -1)        # (B, hw)
-            mt_norm     = torch.nn.functional.normalize(mt_flat, dim=1)
-            cos_mat     = mt_norm @ mt_norm.t()
-            B_d         = cos_mat.size(0)
-            off_mask    = ~torch.eye(B_d, dtype=torch.bool, device=cos_mat.device)
-            off         = cos_mat[off_mask]
-            diag_cosine = float(off.mean()) if off.numel() > 0 else 0.0
-            diag_std    = float(mt_flat.std(dim=1).mean())
-            # Peak-mode share: fraction of batch sharing the same argmax cell
-            _mt_peaks    = [int(m.argmax().item()) for m in mt_flat]
-            _peak_counts = {}
-            for _pk in _mt_peaks:
-                _peak_counts[_pk] = _peak_counts.get(_pk, 0) + 1
-            _peak_mode_share = max(_peak_counts.values()) / max(len(_mt_peaks), 1)
+            for _diag_batch in val_loader:
+                _diag_frames = _diag_batch["frames"].to(device)
+                _diag_out    = model(_diag_frames)
+                _mt_b        = _diag_out.M_t.mean(dim=1)        # (B, h, w)
+                _mt_flat_b   = _mt_b.reshape(_mt_b.size(0), -1) # (B, hw)
+                _all_mt_flat.append(_mt_flat_b.cpu())
+                _all_mt_peaks.extend([int(m.argmax().item()) for m in _mt_flat_b])
+        _all_mt_flat_cat = torch.cat(_all_mt_flat, dim=0)       # (N_val, hw)
+        # cosine similarity over full val set
+        _mt_norm_all    = torch.nn.functional.normalize(_all_mt_flat_cat, dim=1)
+        # compute in chunks to avoid OOM on large val sets
+        _chunk = 64
+        _cos_vals = []
+        for _ci in range(0, len(_mt_norm_all), _chunk):
+            _row = _mt_norm_all[_ci:_ci+_chunk]
+            _cos_block = _row @ _mt_norm_all.t()  # (chunk, N_val)
+            # exclude diagonal (self-similarity)
+            for _ri, _gi in enumerate(range(_ci, min(_ci+_chunk, len(_mt_norm_all)))):
+                _cos_block[_ri, _gi] = 0.0
+            _cos_vals.append(_cos_block.sum(dim=1))
+        _N_val      = len(_mt_norm_all)
+        diag_cosine = float(torch.cat(_cos_vals).sum() / max(_N_val * (_N_val - 1), 1))
+        diag_std    = float(_all_mt_flat_cat.std(dim=1).mean())
+        # peak_mode_share: fraction of val set sharing the dominant argmax cell
+        _peak_counts = {}
+        for _pk in _all_mt_peaks:
+            _peak_counts[_pk] = _peak_counts.get(_pk, 0) + 1
+        _peak_mode_share = max(_peak_counts.values()) / max(len(_all_mt_peaks), 1)
         model.train()
 
         _pass_cos  = diag_cosine     < 0.95

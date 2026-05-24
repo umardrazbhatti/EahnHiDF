@@ -366,11 +366,26 @@ class DeepfakeDataset(Dataset):
             [{"video_path": str(p), "label": 1, "manipulation": "hidf_fake"} for p in fake_split]
         )
 
+        # ── FIX: interleave real/fake before DataLoader sees the list ─────────
+        # Without this shuffle, self.samples is [3488 reals ... 3175 fakes].
+        # DataLoader(shuffle=True, generator=seed42) re-indexes this ordered
+        # block deterministically — early batches are real-heavy, causing the
+        # model to learn "predict real" before it sees enough fakes.
+        # Shuffling here with the same split seed ensures reproducible but
+        # interleaved ordering regardless of DataLoader seed.
+        import random as _random
+        _rng_shuffle = _random.Random(seed)
+        _rng_shuffle.shuffle(self.samples)
+        # ─────────────────────────────────────────────────────────────────────
+
+        _n_real = sum(1 for s in self.samples if s['label'] == 0)
+        _n_fake = sum(1 for s in self.samples if s['label'] == 1)
+        # Verify interleaving worked — first 10 labels should be mixed
+        _first10 = [s['label'] for s in self.samples[:10]]
         print(
             f"[HiDF {self.mode}] sources={len(active)}  "
-            f"real={sum(1 for s in self.samples if s['label'] == 0)}  "
-            f"fake={sum(1 for s in self.samples if s['label'] == 1)}  "
-            f"total={len(self.samples)}"
+            f"real={_n_real}  fake={_n_fake}  total={len(self.samples)}  "
+            f"first10_labels={_first10}  (should be mixed 0s and 1s)"
         )
 
     # ====================================================================
