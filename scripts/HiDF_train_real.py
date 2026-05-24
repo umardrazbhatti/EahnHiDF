@@ -1,5 +1,5 @@
 """
-scripts/train_real.py — Phase 6 GPU training on FF++/Celeb-DF/DFDC.
+scripts/HiDF_train_real.py — Phase 6 GPU training on FF++/Celeb-DF/DFDC/HiDF.
 
 Phase 6 changes vs phase 5d:
   - --max_per_class flag for balanced 1k/1k subsampling  (CHANGE 1)
@@ -9,6 +9,13 @@ Phase 6 changes vs phase 5d:
   - label_smoothing wired through build_classification_loss (CHANGE 6)
   - loss_curves.png + metric_curves.png +
     training_history.csv emitted at end of training       (CHANGE 12)
+
+v2 patch — all-three-metrics fix:
+  [mt_std]         B-pass no_grad REMOVED → loss_faith gradient now reaches
+                   EarlyAttnHead via x_b → M_norm → M_t. PeakSpreadLoss added.
+  [peak_mode_share] PeakSpreadLoss + raised JS-div weight (in HiDF_explanation.py)
+                   directly penalise batch-level peak-location concentration.
+  [cosine]         Untouched — HiDF grouped splitting in datasets.py handles this.
 """
 
 import os
@@ -32,6 +39,7 @@ from models.HiDF_eahn import EAHN
 from losses.HiDF_classification import build_classification_loss
 from losses.HiDF_explanation import (
     ExplanationLoss,
+    PeakSpreadLoss,
     build_bottlenecked_input,
     faithfulness_loss,
     sparsity_loss,
@@ -70,10 +78,6 @@ def main(config: EAHNConfig):
     print(f"Train: {len(train_ds)} | Val: {len(val_ds)}")
 
     # ── DataLoader — Regime A: plain shuffle, no sampler ─────────────────────
-    # max_per_class cap is now applied inside DeepfakeDataset._build_ffpp()
-    # before the split, giving a true 1000:1000 balanced pool (200/type on the
-    # fake side). With balanced data the sampler is redundant and its asymmetric
-    # per-video exposure (real over-drawn, fake under-drawn) hurt convergence.
     print("[Sampler] Mode=shuffled  (WeightedRandomSampler DISABLED for Regime A)")
     _train_generator = torch.Generator()
     _train_generator.manual_seed(42)
@@ -99,12 +103,7 @@ def main(config: EAHNConfig):
     )
     print(f"[DataLoader val] batch_size={config.batch_size}  shuffle=False  size={len(val_ds)}")
 
-    # ── Multi-batch class-balance smoke check (Regime A) ──────────────────────
-    # Under balanced data + shuffle, a single-class first batch occurs ~12% of
-    # the time and is not a bug. Use a disposable side-loader (num_workers=0 so
-    # it doesn't compete with the training loader) and check 3 batches; only
-    # fail if ALL 3 are single-class, which is statistically near-impossible
-    # (~0.05%) and would always indicate a broken split.
+    # ── Smoke check ───────────────────────────────────────────────────────────
     _smoke_loader = DataLoader(
         train_ds, batch_size=config.batch_size, shuffle=True,
         collate_fn=deepfake_collate_fn, num_workers=0,
@@ -138,7 +137,6 @@ def main(config: EAHNConfig):
         optimizer, T_max=config.epochs, eta_min=1e-6
     )
 
-    # AMP — FP16 on T4 (sm_75). BF16 only on Ampere+. Disable on CPU.
     _use_amp = (
         config.use_amp
         and device.type == "cuda"
@@ -156,7 +154,7 @@ def main(config: EAHNConfig):
     best_metric = -1.0
     if config.resume_checkpoint and os.path.exists(config.resume_checkpoint):
         ckpt        = load_checkpoint(config.resume_checkpoint, model, optimizer, scheduler)
-        start_epoch = ckpt.get("epoch", 0)      # already-completed epoch count (1-indexed)
+        start_epoch = ckpt.get("epoch", 0)
         best_metric = ckpt.get("best_metric", 0.0)
         print(f"[Resume] Loaded {config.resume_checkpoint}, "
               f"resuming from epoch {start_epoch + 1}  (best_metric={best_metric:.4f})")
@@ -164,33 +162,40 @@ def main(config: EAHNConfig):
         print(f"[Resume] Checkpoint not found at {config.resume_checkpoint!r} — starting fresh.")
 
     # ── Losses ────────────────────────────────────────────────────────────────
-    # CHANGE 6: label_smoothing read from config by build_classification_loss
     cls_loss_fn = build_classification_loss(config)
     print(
         f"[ClsLoss] {cls_loss_fn.__class__.__name__}  "
         f"label_smoothing={getattr(config, 'label_smoothing', 0.0)}"
     )
-    exp_loss_fn  = ExplanationLoss(
+
+    exp_loss_fn   = ExplanationLoss(
         alpha=config.alpha,
         beta=config.beta,
-        diversity_weight=config.attn_diversity_weight,
+        diversity_weight=config.attn_diversity_weight,  # already raised to 4.0 in explanation.py default
     )
-    temp_loss_fn = TemporalConsistencyLoss(gamma=config.gamma)
+    temp_loss_fn  = TemporalConsistencyLoss(gamma=config.gamma)
+
+    # v2: PeakSpreadLoss — penalises the whole batch sharing the same argmax cell
+    _lambda_peak_spread = float(getattr(config, "lambda_peak_spread", 0.3))
+    peak_spread_fn = PeakSpreadLoss(tau_soft=1.0)
+    print(f"[PeakSpreadLoss] lambda_peak_spread={_lambda_peak_spread}")
 
     ckpt_path = os.path.join(config.output_dir, f"eahn_{config.dataset_name}_best.pth")
 
-    # ── CHANGE 12a: epoch-level training history ───────────────────────────────
+    # ── History ───────────────────────────────────────────────────────────────
     history = {
         "epoch":               [],
         "train_total":         [], "train_cls":    [],
         "train_exp":           [], "train_temp":   [],
         "train_faith":         [], "train_sparse": [],
+        "train_peak_spread":   [],                      # v2: new term
         "val_auc_roc":         [], "val_balanced_acc":      [],
         "val_real_acc":        [], "val_fake_acc":          [],
         "val_inter_sample_cos": [], "val_mt_std":           [],
+        "val_peak_mode_share":  [],                     # v2: now tracked in history
     }
 
-    # ── Task 3.3: early stopping state ────────────────────────────────────────
+    # ── Early stopping ────────────────────────────────────────────────────────
     _es_patience  = int(getattr(config, "early_stop_patience",  5))
     _es_min_delta = float(getattr(config, "early_stop_min_delta", 0.001))
     _es_metric    = str(getattr(config, "early_stop_metric", "val_balanced_accuracy"))
@@ -202,24 +207,14 @@ def main(config: EAHNConfig):
         f"min_delta={_es_min_delta}"
     )
 
-    # CHANGE 6 (phase7): build a parallel "clean" loader using the val
-    # transform (no augmentation) but the train sample list. If the model
-    # later reports high train accuracy on the augmented loader but low
-    # accuracy on this clean loader, the model is learning the augmentation
-    # pattern, not face features.
+    # ── Clean train loader (augmentation shortcut detection) ──────────────────
     from copy import deepcopy
     import torch as _torch
     _clean_ds = deepcopy(train_ds)
     _clean_ds.heavy_aug = False
-    # Force every getitem to use the VAL transform (deterministic resize+norm):
     from data.HiDF_transforms import get_transforms
     _clean_ds.transform = get_transforms("val", config.frame_size)
-    # Also disable the heavy-aug branch entirely by setting minority_class to
-    # a sentinel that never matches any real label:
     _clean_ds.minority_class = -1
-    # shuffle=True so the 200-sample cap sees a representative real+fake mix.
-    # HiDF samples are ordered [all real, all fake] — without shuffle the cap
-    # would only ever evaluate real samples, giving a spurious fake_acc=0.000.
     _clean_gen = torch.Generator()
     _clean_gen.manual_seed(42)
     _clean_loader = DataLoader(
@@ -232,58 +227,70 @@ def main(config: EAHNConfig):
 
     # ── Training loop ─────────────────────────────────────────────────────────
     total_batches = len(train_loader)
-    epoch_w       = len(str(start_epoch + config.epochs))  # width for log padding
+    epoch_w       = len(str(start_epoch + config.epochs))
 
     for epoch in range(start_epoch + 1, start_epoch + config.epochs + 1):
-        # epoch is 1-indexed: 1 = first ever epoch, 2 = second, etc.
-        # config.epochs is always the number of epochs in THIS session.
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
-        # ── CHANGE 12b: per-epoch loss accumulator ────────────────────────────
         epoch_acc = {
             "total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0,
-            "faith": 0.0, "sparse": 0.0, "n": 0,
+            "faith": 0.0, "sparse": 0.0, "peak_spread": 0.0, "n": 0,
         }
 
-        # ── CHANGE 3: rolling log accumulator ────────────────────────────────
         LOG_EVERY = 200
         run = {
             "total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0,
-            "cons": 0.0, "faith": 0.0, "sparse": 0.0, "n": 0,
+            "cons": 0.0, "faith": 0.0, "sparse": 0.0,
+            "peak_spread": 0.0, "n": 0,
         }
 
         for batch_idx, batch in enumerate(train_loader):
-            frames   = batch["frames"].to(device, non_blocking=True)
-            labels   = batch["label"].to(device, non_blocking=True)
+            frames = batch["frames"].to(device, non_blocking=True)
+            labels = batch["label"].to(device, non_blocking=True)
 
             with autocast(_dev_str, enabled=_use_amp, dtype=_amp_dtype):
-                # ── Phase 21 two-pass forward ─────────────────────────────────
+                # ── Pass A: normal forward ────────────────────────────────────
                 out_A    = model(frames)
                 logits_A = out_A.logit
-                M_t      = out_A.M_t                        # early M_t (B, T, h, w)
+                M_t      = out_A.M_t          # (B, T, h, w) from EarlyAttnHead
                 loss_cls = cls_loss_fn(logits_A, labels)
 
                 if config.phase21_enabled:
+                    # ── Pass B: bottlenecked input — gradient ENABLED ─────────
+                    # v2 FIX: no_grad REMOVED here.
+                    # Gradient path: loss_faith → logits_B → model(x_b)
+                    #                → x_b → M_norm → M_t → EarlyAttnHead
+                    # This gives EarlyAttnHead a real gradient from faithfulness,
+                    # forcing it to produce maps that actually gate meaningful
+                    # regions → mt_std rises above 0.15.
+                    #
+                    # Memory note: storing B-pass activations costs ~same as A-pass.
+                    # With batch_size=2, grad_accum=2 this is fine on T4 (8GB).
+                    # If OOM occurs, reduce batch_size or increase grad_accum_steps.
                     x_b = build_bottlenecked_input(
                         frames, M_t,
                         blur_kernel=config.blur_kernel,
                         blur_sigma=config.blur_sigma,
                     )
-                    # Pass B: no_grad to avoid storing activations for backward.
-                    # loss_faith is a monitoring metric; M_t trains via cls + sparsity gradients.
-                    with torch.no_grad():
-                        out_B = model(x_b)
+                    out_B       = model(x_b)           # GRAD ENABLED (v2 fix)
                     loss_faith  = faithfulness_loss(logits_A, out_B.logit)
                     loss_sparse = sparsity_loss(M_t)
                 else:
                     loss_faith  = torch.zeros((), device=frames.device)
                     loss_sparse = torch.zeros((), device=frames.device)
 
+                # ── Explanation + temporal ────────────────────────────────────
                 exp_out = exp_loss_fn(M_t)
                 l_exp   = exp_out.loss
                 l_temp  = temp_loss_fn(M_t, out_A.low_level)
 
+                # ── PeakSpreadLoss (v2) ───────────────────────────────────────
+                # Penalises the batch when all samples share the same argmax cell.
+                # This directly attacks peak_mode_share > 0.30.
+                l_peak_spread = peak_spread_fn(M_t)
+
+                # ── Loss weighting ────────────────────────────────────────────
                 _global_step = (epoch - 1) * len(train_loader) + batch_idx
                 _lambda1_eff = config.lambda1 * min(1.0, _global_step / 200.0)
                 lam_faith_eff = _faith_warmup(
@@ -291,15 +298,13 @@ def main(config: EAHNConfig):
                 )
 
                 l_total = (loss_cls
-                           + lam_faith_eff        * loss_faith
-                           + config.lambda_sparse  * loss_sparse
-                           + _lambda1_eff          * l_exp
-                           + config.lambda2        * l_temp)
-                # ─────────────────────────────────────────────────────────────
+                           + lam_faith_eff          * loss_faith
+                           + config.lambda_sparse    * loss_sparse
+                           + _lambda1_eff            * l_exp
+                           + config.lambda2          * l_temp
+                           + _lambda_peak_spread     * l_peak_spread)
 
-                # Consistency regularization — penalise augmented branch for deviating
-                # from clean-branch prediction.  Clean branch runs under no_grad so
-                # only the augmented branch receives the gradient signal.
+                # ── Consistency regularisation (unchanged) ────────────────────
                 _lambda_cons = float(getattr(config, "lambda_consistency", 0.0))
                 if _lambda_cons > 0 and "frames_clean" in batch:
                     _frames_clean = batch["frames_clean"].to(device, non_blocking=True)
@@ -323,42 +328,47 @@ def main(config: EAHNConfig):
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
 
-            # ── First-batch diagnostics (first epoch of this session only) ──────
+            # ── First-batch diagnostics ───────────────────────────────────────
             if epoch == start_epoch + 1 and batch_idx == 0:
                 print(f"[DIAG] M_t mean={out_A.M_t.mean():.4f} std={out_A.M_t.std():.4f}")
-                print(f"[DIAG] L_cls={loss_cls.item():.6f} L_exp={l_exp.item():.6f} "
-                      f"L_temp={l_temp.item():.6f}  L_faith={loss_faith.item():.6f} "
-                      f"L_sparse={loss_sparse.item():.6f}")
+                print(f"[DIAG] L_cls={loss_cls.item():.6f}  L_exp={l_exp.item():.6f}  "
+                      f"L_temp={l_temp.item():.6f}  L_faith={loss_faith.item():.6f}  "
+                      f"L_sparse={loss_sparse.item():.6f}  "
+                      f"L_peak_spread={l_peak_spread.item():.6f}")
+                print(f"[DIAG] lam_faith_eff={lam_faith_eff:.4f}  "
+                      f"lambda_peak_spread={_lambda_peak_spread}  "
+                      f"lambda_sparse={config.lambda_sparse}")
                 print(f"[DIAG] attn_temp=exp({model.cross_attention.log_temp.item():.3f})"
                       f"={torch.exp(model.cross_attention.log_temp).item():.3f}")
 
-            # ── Batch balance check every LOG_EVERY steps ─────────────────────
+            # ── Batch balance check ───────────────────────────────────────────
             if (batch_idx + 1) % LOG_EVERY == 0:
                 bl = batch["label"].detach().cpu().numpy().astype(int)
                 n_real, n_fake = int((bl == 0).sum()), int((bl == 1).sum())
                 print(f"[BatchBalance] step={batch_idx+1} real={n_real} fake={n_fake}")
 
             # ── Accumulate losses ─────────────────────────────────────────────
-            _lt    = l_total.item()
-            _lc    = loss_cls.item()
-            _le    = l_exp.item()
-            _lp    = l_temp.item()
-            _lcons = l_consistency.item()
-            _lf    = loss_faith.item()
-            _ls    = loss_sparse.item()
+            _lt  = l_total.item()
+            _lc  = loss_cls.item()
+            _le  = l_exp.item()
+            _lp  = l_temp.item()
+            _lco = l_consistency.item()
+            _lf  = loss_faith.item()
+            _ls  = loss_sparse.item()
+            _lps = l_peak_spread.item()
 
-            run["total"]  += _lt;  run["cls"]    += _lc
-            run["exp"]    += _le;  run["temp"]   += _lp
-            run["cons"]   += _lcons
-            run["faith"]  += _lf;  run["sparse"] += _ls
-            run["n"]      += 1
+            run["total"]       += _lt;  run["cls"]    += _lc
+            run["exp"]         += _le;  run["temp"]   += _lp
+            run["cons"]        += _lco
+            run["faith"]       += _lf;  run["sparse"] += _ls
+            run["peak_spread"] += _lps; run["n"]      += 1
 
-            epoch_acc["total"]  += _lt;  epoch_acc["cls"]    += _lc
-            epoch_acc["exp"]    += _le;  epoch_acc["temp"]   += _lp
-            epoch_acc["faith"]  += _lf;  epoch_acc["sparse"] += _ls
-            epoch_acc["n"]      += 1
+            epoch_acc["total"]       += _lt;  epoch_acc["cls"]    += _lc
+            epoch_acc["exp"]         += _le;  epoch_acc["temp"]   += _lp
+            epoch_acc["faith"]       += _lf;  epoch_acc["sparse"] += _ls
+            epoch_acc["peak_spread"] += _lps; epoch_acc["n"]      += 1
 
-            # ── CHANGE 3: rolling log (every LOG_EVERY batches) ──────────────
+            # ── Rolling log ───────────────────────────────────────────────────
             if (batch_idx + 1) % LOG_EVERY == 0 or (batch_idx + 1) == total_batches:
                 n = max(run["n"], 1)
                 _tau = model.cross_attention.log_temp.exp().item()
@@ -367,22 +377,28 @@ def main(config: EAHNConfig):
                     f"total={run['total']/n:.4f}  cls={run['cls']/n:.4f}  "
                     f"exp={run['exp']/n:.4f}  temp={run['temp']/n:.4f}  "
                     f"faith={run['faith']/n:.4f}  sparse={run['sparse']/n:.4f}  "
+                    f"peak_spread={run['peak_spread']/n:.4f}  "
                     f"cons={run['cons']/n:.4f}  "
                     f"tau={_tau:.2f}  sim={exp_out.inter_sample_sim:.2f}"
                 )
-                run = {"total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0, "cons": 0.0, "faith": 0.0, "sparse": 0.0, "n": 0}
+                run = {
+                    "total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0,
+                    "cons": 0.0, "faith": 0.0, "sparse": 0.0,
+                    "peak_spread": 0.0, "n": 0,
+                }
 
         scheduler.step()
 
-        # ── CHANGE 12b cont.: store epoch-average train losses ─────────────────
+        # ── Epoch-average train losses ─────────────────────────────────────────
         n = max(epoch_acc["n"], 1)
-        history["epoch"].append(epoch)   # 1-indexed epoch number
-        history["train_total"].append(epoch_acc["total"]  / n)
-        history["train_cls"].append(epoch_acc["cls"]      / n)
-        history["train_exp"].append(epoch_acc["exp"]      / n)
-        history["train_temp"].append(epoch_acc["temp"]    / n)
-        history["train_faith"].append(epoch_acc["faith"]  / n)
-        history["train_sparse"].append(epoch_acc["sparse"] / n)
+        history["epoch"].append(epoch)
+        history["train_total"].append(epoch_acc["total"]       / n)
+        history["train_cls"].append(epoch_acc["cls"]           / n)
+        history["train_exp"].append(epoch_acc["exp"]           / n)
+        history["train_temp"].append(epoch_acc["temp"]         / n)
+        history["train_faith"].append(epoch_acc["faith"]       / n)
+        history["train_sparse"].append(epoch_acc["sparse"]     / n)
+        history["train_peak_spread"].append(epoch_acc["peak_spread"] / n)
 
         # ── Validation ────────────────────────────────────────────────────────
         model.eval()
@@ -412,7 +428,7 @@ def main(config: EAHNConfig):
             f"balanced_acc={_val_bal_acc:.3f}"
         )
 
-        # ── CHANGE 4: attention-diversity diagnostic on first val batch ────────
+        # ── Attention-diversity diagnostic (v2: full PASS/FAIL + peak_mode_share) ──
         with torch.no_grad():
             diag_batch  = next(iter(val_loader))
             diag_frames = diag_batch["frames"].to(device)
@@ -426,26 +442,39 @@ def main(config: EAHNConfig):
             off         = cos_mat[off_mask]
             diag_cosine = float(off.mean()) if off.numel() > 0 else 0.0
             diag_std    = float(mt_flat.std(dim=1).mean())
+            # Peak-mode share: fraction of batch sharing the same argmax cell
+            _mt_peaks    = [int(m.argmax().item()) for m in mt_flat]
+            _peak_counts = {}
+            for _pk in _mt_peaks:
+                _peak_counts[_pk] = _peak_counts.get(_pk, 0) + 1
+            _peak_mode_share = max(_peak_counts.values()) / max(len(_mt_peaks), 1)
         model.train()
+
+        _pass_cos  = diag_cosine     < 0.95
+        _pass_std  = diag_std        > 0.15
+        _pass_peak = _peak_mode_share < 0.30
         print(
-            f"[Diag] epoch={epoch} "
-            f"inter_sample_cos={diag_cosine:.3f}  mt_std={diag_std:.4f}"
+            f"[Diag] epoch={epoch}  scale=1.00  "
+            f"inter_sample_cos={diag_cosine:.3f} {'PASS' if _pass_cos  else 'FAIL'}  "
+            f"mt_std={diag_std:.4f} {'PASS' if _pass_std  else 'FAIL'}  "
+            f"peak_mode_share={_peak_mode_share:.3f} {'PASS' if _pass_peak else 'FAIL'}"
         )
 
-        # ── CHANGE 12c: val metrics history ───────────────────────────────────
+        # ── History ───────────────────────────────────────────────────────────
         history["val_auc_roc"].append(float(metrics.get("auc_roc", float("nan"))))
         history["val_balanced_acc"].append(_val_bal_acc)
         history["val_real_acc"].append(_val_real_acc)
         history["val_fake_acc"].append(_val_fake_acc)
         history["val_inter_sample_cos"].append(diag_cosine)
         history["val_mt_std"].append(diag_std)
+        history["val_peak_mode_share"].append(_peak_mode_share)
 
-        # CHANGE 6 cont.: deterministic-aug train accuracy
+        # ── Clean-train sanity check ───────────────────────────────────────────
         model.eval()
         _clean_probs, _clean_labels = [], []
         with _torch.no_grad():
             for _i, _b in enumerate(_clean_loader):
-                if _i * config.batch_size >= 200:   # cap at ~200 samples
+                if _i * config.batch_size >= 200:
                     break
                 _f = _b["frames"].to(device)
                 _o = model(_f)
@@ -461,25 +490,20 @@ def main(config: EAHNConfig):
               f"fake_acc={_clean_fake_acc:.3f}  "
               f"(if real_acc is much lower than val real_acc, aug shortcut still live)")
 
-        # Augmentation shortcut gate: fake_acc on clean (unaugmented) train data
-        # should climb above 0.20 by epoch 2 if the model is learning real fake features.
         if _clean_fake_acc < 0.20:
             print(
                 f"[sanity] WARNING — AUGMENTATION SHORTCUT DETECTED: "
-                f"train_clean fake_acc={_clean_fake_acc:.3f} < 0.20. "
-                f"Model is using augmentation artifacts as fake signal. "
-                f"Check HiDF_transforms.py — Fix 1 may not have applied correctly."
+                f"train_clean fake_acc={_clean_fake_acc:.3f} < 0.20."
             )
             if epoch >= 2:
                 print(
                     f"[sanity] STOP CONDITION: train_clean fake_acc still < 0.20 at epoch {epoch}. "
-                    f"Do not continue training — diagnose augmentation pipeline first."
+                    f"Diagnose augmentation pipeline first."
                 )
 
         model.train()
 
         # ── Checkpoint ────────────────────────────────────────────────────────
-        val_auc = metrics.get("auc_roc", float("nan"))
         SELECTION_KEY = "balanced_accuracy_at_optimal"
         sel = metrics.get(SELECTION_KEY)
         if sel is None or not np.isfinite(sel):
@@ -511,8 +535,79 @@ def main(config: EAHNConfig):
             print(f"[Checkpoint] last_checkpoint.pth saved  "
                   f"(epoch={epoch}, best_metric={best_metric:.4f})")
 
-        # ── Task 3.3: early stopping check ────────────────────────────────────
-        # Metric key mapping (history dict uses abbreviated keys)
+        # ── Always-save last_epoch.pth ─────────────────────────────────────────
+        _last_epoch_path = os.path.join(config.output_dir, "last_epoch.pth")
+        _last_epoch_tmp  = _last_epoch_path + ".tmp"
+        torch.save(
+            {
+                "epoch":                epoch,
+                "model_state_dict":     model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "best_metric":          best_metric,
+                "config":               _dataclasses.asdict(config),
+            },
+            _last_epoch_tmp,
+        )
+        os.replace(_last_epoch_tmp, _last_epoch_path)
+        print(f"[Checkpoint] last_epoch.pth saved (epoch={epoch}, best_metric={best_metric:.4f})")
+
+        import gc
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            _cur_mem  = torch.cuda.memory_allocated(device)  / 1e9
+            _peak_mem = torch.cuda.max_memory_allocated(device) / 1e9
+            print(f"[Mem] epoch={epoch}  cur={_cur_mem:.2f}GB  peak={_peak_mem:.2f}GB")
+            torch.cuda.reset_peak_memory_stats(device)
+
+        # ── Phase 21 snapshot ──────────────────────────────────────────────────
+        if getattr(config, "phase21_enabled", True) and \
+                ((epoch + 1) % config.snapshot_every == 0):
+            snap_dir = Path(config.output_dir) / "snapshots" / f"epoch_{epoch+1:02d}"
+            snap_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {"epoch": epoch + 1, "model_state_dict": model.state_dict()},
+                snap_dir / "model.pth",
+            )
+            with torch.no_grad():
+                mt_stats = {
+                    "mean": float(M_t.mean().item()),
+                    "std":  float(M_t.std().item()),
+                    "peak_per_frame_mean": float(M_t.amax(dim=(-2, -1)).mean().item()),
+                    "min":  float(M_t.min().item()),
+                    "max":  float(M_t.max().item()),
+                }
+
+            def _avg(key):
+                _n = max(1, epoch_acc.get("n", 1))
+                return float(epoch_acc.get(key, 0.0)) / _n
+
+            snap_meta = {
+                "epoch":                epoch + 1,
+                "train_loss_cls":       _avg("cls"),
+                "train_loss_faith":     _avg("faith"),
+                "train_loss_sparse":    _avg("sparse"),
+                "train_loss_peak_spread": _avg("peak_spread"),
+                "train_loss_exp":       _avg("exp"),
+                "train_loss_temp":      _avg("temp"),
+                "train_loss_total":     _avg("total"),
+                "lam_faith_eff":        float(lam_faith_eff),
+                "lambda_peak_spread":   float(_lambda_peak_spread),
+                "val_auc_roc":          float(metrics.get("auc_roc", -1.0)),
+                "val_balanced_acc":     float(metrics.get("balanced_accuracy", -1.0)),
+                "val_real_acc":         float(metrics.get("real_accuracy", -1.0)),
+                "val_fake_acc":         float(metrics.get("fake_accuracy", -1.0)),
+                "diag_inter_sample_cos": diag_cosine,
+                "diag_mt_std":          diag_std,
+                "diag_peak_mode_share": _peak_mode_share,
+                "M_t_stats_last_batch": mt_stats,
+            }
+            with open(snap_dir / "meta.json", "w") as _sf:
+                json.dump(snap_meta, _sf, indent=2)
+            print(f"[Phase21 snapshot] saved → {snap_dir}")
+
+        # ── Early stopping check ───────────────────────────────────────────────
         _es_metric_map = {
             "val_balanced_accuracy": "val_balanced_acc",
             "val_balanced_acc":      "val_balanced_acc",
@@ -539,63 +634,34 @@ def main(config: EAHNConfig):
                         f"[EarlyStopping] TRIGGERED at epoch {epoch}. "
                         f"Restoring best checkpoint ({SELECTION_KEY}={best_metric:.4f})."
                     )
-                    # Restore best weights before returning
                     if os.path.exists(ckpt_path):
                         load_checkpoint(ckpt_path, model)
                         print(f"[EarlyStopping] Best weights restored from {ckpt_path}")
                     _es_triggered = True
-                    break   # exit the epoch for-loop
-
-        # ── Phase 21 snapshot every N epochs ──────────────────────────────────
-        if getattr(config, "phase21_enabled", True) and \
-                ((epoch + 1) % config.snapshot_every == 0):
-            snap_dir = Path(config.output_dir) / "snapshots" / f"epoch_{epoch+1:02d}"
-            snap_dir.mkdir(parents=True, exist_ok=True)
-
-            torch.save(
-                {"epoch": epoch + 1, "model_state_dict": model.state_dict()},
-                snap_dir / "model.pth",
-            )
-
-            with torch.no_grad():
-                mt_stats = {
-                    "mean": float(M_t.mean().item()),
-                    "std":  float(M_t.std().item()),
-                    "peak_per_frame_mean": float(M_t.amax(dim=(-2, -1)).mean().item()),
-                    "min": float(M_t.min().item()),
-                    "max": float(M_t.max().item()),
-                }
-
-            def _avg(key):
-                _n = max(1, epoch_acc.get("n", 1))
-                return float(epoch_acc.get(key, 0.0)) / _n
-
-            snap_meta = {
-                "epoch":             epoch + 1,
-                "train_loss_cls":    _avg("cls"),
-                "train_loss_faith":  _avg("faith"),
-                "train_loss_sparse": _avg("sparse"),
-                "train_loss_exp":    _avg("exp"),
-                "train_loss_temp":   _avg("temp"),
-                "train_loss_total":  _avg("total"),
-                "lam_faith_eff":     float(lam_faith_eff),
-                "val_auc_roc":       float(metrics.get("auc_roc", -1.0)),
-                "val_balanced_acc":  float(metrics.get("balanced_accuracy", -1.0)),
-                "val_real_acc":      float(metrics.get("real_accuracy", -1.0)),
-                "val_fake_acc":      float(metrics.get("fake_accuracy", -1.0)),
-                "M_t_stats_last_batch": mt_stats,
-            }
-            with open(snap_dir / "meta.json", "w") as _sf:
-                json.dump(snap_meta, _sf, indent=2)
-            print(f"[Phase21 snapshot] saved → {snap_dir}")
-        # ──────────────────────────────────────────────────────────────────────
+                    break
 
     logger.close()
     _stop_reason = "early stopping" if _es_triggered else "epoch limit"
     print(f"\nTraining complete ({_stop_reason}). "
           f"Best balanced_accuracy_at_optimal: {best_metric:.4f}")
 
-    # ── CHANGE 12d: end-of-run plots and CSV ──────────────────────────────────
+    # ── Save final model ───────────────────────────────────────────────────────
+    _final_path = os.path.join(config.output_dir, "final_model.pth")
+    torch.save(
+        {
+            "epoch":                epoch,
+            "model_state_dict":     model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "best_metric":          best_metric,
+            "config":               _dataclasses.asdict(config),
+        },
+        _final_path,
+    )
+    print(f"[Checkpoint] final_model.pth saved  "
+          f"(epoch={epoch}, best_metric={best_metric:.4f}, stop_reason={_stop_reason})")
+
+    # ── End-of-run plots and CSV ───────────────────────────────────────────────
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -604,7 +670,6 @@ def main(config: EAHNConfig):
         out_path = Path(config.output_dir)
         out_path.mkdir(parents=True, exist_ok=True)
 
-        # Save raw history to CSV
         csv_hist = out_path / "training_history.csv"
         with open(csv_hist, "w", newline="") as f:
             w = _csv.writer(f)
@@ -612,91 +677,83 @@ def main(config: EAHNConfig):
             w.writerows(zip(*history.values()))
         print(f"[plot] saved {csv_hist}")
 
-        # Plot 1: training loss convergence (2x2)
-        fig, axes = plt.subplots(2, 2, figsize=(11, 7))
+        fig, axes = plt.subplots(2, 3, figsize=(15, 7))
         for ax, (key, title) in zip(axes.flat, [
-            ("train_total", "Total Loss"),
-            ("train_cls",   "Classification Loss"),
-            ("train_exp",   "Explanation Loss"),
-            ("train_temp",  "Temporal Consistency Loss"),
+            ("train_total",       "Total Loss"),
+            ("train_cls",         "Classification Loss"),
+            ("train_exp",         "Explanation Loss"),
+            ("train_temp",        "Temporal Consistency Loss"),
+            ("train_faith",       "Faithfulness Loss"),
+            ("train_peak_spread", "Peak Spread Loss (v2)"),
         ]):
             ax.plot(history["epoch"], history[key], marker="o", linewidth=2)
-            ax.set_title(title)
-            ax.set_xlabel("Epoch")
-            ax.set_ylabel("Loss")
+            ax.set_title(title); ax.set_xlabel("Epoch"); ax.set_ylabel("Loss")
             ax.grid(alpha=0.3)
-        fig.suptitle("EAHN — Training Loss Convergence", fontsize=13)
+        fig.suptitle("EAHN-HiDF — Training Loss Convergence (v2)", fontsize=13)
         fig.tight_layout()
         fig.savefig(out_path / "loss_curves.png", dpi=120)
         plt.close(fig)
         print(f"[plot] saved {out_path / 'loss_curves.png'}")
 
-        # Plot 2: validation metric trajectories (2x2)
         fig, axes = plt.subplots(2, 2, figsize=(11, 7))
         for ax, (keys, title) in zip(axes.flat, [
-            (["val_auc_roc"],                         "Val AUC-ROC"),
-            (["val_real_acc", "val_fake_acc"],        "Per-class Val Accuracy"),
-            (["val_balanced_acc"],                    "Val Balanced Accuracy"),
-            (["val_inter_sample_cos", "val_mt_std"],  "Attention Diversity"),
+            (["val_auc_roc"],                              "Val AUC-ROC"),
+            (["val_real_acc", "val_fake_acc"],             "Per-class Val Accuracy"),
+            (["val_balanced_acc"],                         "Val Balanced Accuracy"),
+            (["val_inter_sample_cos", "val_mt_std",
+              "val_peak_mode_share"],                      "Attention Diversity (v2)"),
         ]):
             for k in keys:
-                ax.plot(history["epoch"], history[k],
-                        marker="o", linewidth=2, label=k)
+                if k in history:
+                    ax.plot(history["epoch"], history[k],
+                            marker="o", linewidth=2, label=k)
             if "AUC" in title or "Balanced" in title:
-                ax.axhline(0.5, color="grey", linestyle="--",
-                           alpha=0.5, label="random")
-            ax.set_title(title)
-            ax.set_xlabel("Epoch")
-            ax.grid(alpha=0.3)
-            ax.legend(fontsize=8)
-        fig.suptitle("EAHN — Validation Metric Trajectories", fontsize=13)
+                ax.axhline(0.5, color="grey", linestyle="--", alpha=0.5, label="random")
+            # Target lines for the three metrics
+            if "Diversity" in title:
+                ax.axhline(0.95, color="red",   linestyle=":", alpha=0.7,
+                           label="cos threshold (0.95)")
+                ax.axhline(0.15, color="green", linestyle=":", alpha=0.7,
+                           label="mt_std threshold (0.15)")
+                ax.axhline(0.30, color="blue",  linestyle=":", alpha=0.7,
+                           label="peak_mode threshold (0.30)")
+            ax.set_title(title); ax.set_xlabel("Epoch")
+            ax.grid(alpha=0.3); ax.legend(fontsize=7)
+        fig.suptitle("EAHN-HiDF — Validation Metric Trajectories (v2)", fontsize=13)
         fig.tight_layout()
         fig.savefig(out_path / "metric_curves.png", dpi=120)
         plt.close(fig)
         print(f"[plot] saved {out_path / 'metric_curves.png'}")
 
-        # Task 2.1: validation accuracy curves (4 lines, dual y-axis)
         plots_dir = out_path / "plots"
         plots_dir.mkdir(parents=True, exist_ok=True)
         _manip = getattr(config, "active_manipulation", "")
         fig2, ax2_acc = plt.subplots(figsize=(10, 6))
         ax2_auc = ax2_acc.twinx()
-
-        ax2_acc.plot(
-            history["epoch"], history["val_balanced_acc"],
-            marker="o", linewidth=2.5, color="tab:blue",
-            label="val_balanced_accuracy",
-        )
-        ax2_acc.plot(
-            history["epoch"], history["val_real_acc"],
-            marker="s", linewidth=1.5, linestyle="--", color="tab:green",
-            label="val_real_accuracy",
-        )
-        ax2_acc.plot(
-            history["epoch"], history["val_fake_acc"],
-            marker="^", linewidth=1.5, linestyle="--", color="tab:red",
-            label="val_fake_accuracy",
-        )
+        ax2_acc.plot(history["epoch"], history["val_balanced_acc"],
+                     marker="o", linewidth=2.5, color="tab:blue",
+                     label="val_balanced_accuracy")
+        ax2_acc.plot(history["epoch"], history["val_real_acc"],
+                     marker="s", linewidth=1.5, linestyle="--",
+                     color="tab:green", label="val_real_accuracy")
+        ax2_acc.plot(history["epoch"], history["val_fake_acc"],
+                     marker="^", linewidth=1.5, linestyle="--",
+                     color="tab:red", label="val_fake_accuracy")
         ax2_acc.axhline(0.5, color="grey", linestyle=":", alpha=0.6, linewidth=1)
         ax2_acc.set_xlabel("Epoch")
         ax2_acc.set_ylabel("Accuracy / Balanced Accuracy", color="tab:blue")
         ax2_acc.set_ylim(0, 1)
         ax2_acc.tick_params(axis="y", labelcolor="tab:blue")
-
-        ax2_auc.plot(
-            history["epoch"], history["val_auc_roc"],
-            marker="D", linewidth=2, linestyle="-", color="tab:purple", alpha=0.7,
-            label="val_auc_roc",
-        )
+        ax2_auc.plot(history["epoch"], history["val_auc_roc"],
+                     marker="D", linewidth=2, linestyle="-",
+                     color="tab:purple", alpha=0.7, label="val_auc_roc")
         ax2_auc.set_ylabel("AUC-ROC", color="tab:purple")
         ax2_auc.set_ylim(0, 1)
         ax2_auc.tick_params(axis="y", labelcolor="tab:purple")
-
-        # Combine legends from both axes
         lines2a, labels2a = ax2_acc.get_legend_handles_labels()
         lines2b, labels2b = ax2_auc.get_legend_handles_labels()
-        ax2_acc.legend(lines2a + lines2b, labels2a + labels2b, loc="lower right", fontsize=9)
-
+        ax2_acc.legend(lines2a + lines2b, labels2a + labels2b,
+                       loc="lower right", fontsize=9)
         title_manip = f" — {_manip}" if _manip else ""
         fig2.suptitle(f"Validation Performance per Epoch{title_manip}", fontsize=13)
         fig2.tight_layout()
