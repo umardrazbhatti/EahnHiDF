@@ -1,11 +1,18 @@
 """
 data/face_align.py — MTCNN face detector with tracking-based crop and disk cache.
 Detects on frame 0; re-detects every 5 frames; falls back to centre-crop.
+
+v2 patch — disk guard:
+  np.save is now guarded by a free-space check. If free disk space on the
+  cache volume falls below CACHE_MIN_FREE_GB (default 3.0 GB), the cache
+  entry is silently skipped. This prevents the OSError / disk-full crash that
+  occurred during evaluation when the face-cache filled /kaggle/working.
 """
 
 import cv2
 import numpy as np
 import os
+import shutil
 import warnings
 
 try:
@@ -13,6 +20,20 @@ try:
     _MTCNN_AVAILABLE = True
 except ImportError:
     _MTCNN_AVAILABLE = False
+
+# Minimum free space (GB) required before writing a cache entry.
+# Set to 3.0 so there is always headroom for checkpoints / plots.
+CACHE_MIN_FREE_GB = 3.0
+
+
+def _has_disk_space(path: str, min_free_gb: float = CACHE_MIN_FREE_GB) -> bool:
+    """Return True if the volume containing *path* has >= min_free_gb free."""
+    try:
+        usage = shutil.disk_usage(path)
+        free_gb = usage.free / 1e9
+        return free_gb >= min_free_gb
+    except Exception:
+        return False  # if we can't check, be conservative and skip the write
 
 
 class FaceAligner:
@@ -77,9 +98,21 @@ class FaceAligner:
             crop = cv2.resize(crop, (output_size, output_size))
             aligned.append(crop)
 
+        # ── Disk-guarded cache write ───────────────────────────────────────────
         if self.cache_dir:
-            os.makedirs(self.cache_dir, exist_ok=True)
-            np.save(cache_path, np.array(aligned, dtype=np.uint8))
+            check_dir = self.cache_dir if os.path.exists(self.cache_dir) else \
+                        os.path.dirname(self.cache_dir) or "/"
+            if _has_disk_space(check_dir):
+                os.makedirs(self.cache_dir, exist_ok=True)
+                try:
+                    np.save(cache_path, np.array(aligned, dtype=np.uint8))
+                except OSError as e:
+                    warnings.warn(f"[FaceAligner] cache write failed ({e}), continuing.")
+            else:
+                warnings.warn(
+                    f"[FaceAligner] disk space below {CACHE_MIN_FREE_GB} GB — "
+                    f"skipping cache write for {video_id}."
+                )
 
         return aligned
 

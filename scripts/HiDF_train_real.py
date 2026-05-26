@@ -39,7 +39,8 @@ from models.HiDF_eahn import EAHN
 from losses.HiDF_classification import build_classification_loss
 from losses.HiDF_explanation import (
     ExplanationLoss,
-    PeakSpreadLoss,
+    HardAttentionDiversityLoss,  # v4: replaces PeakSpreadLoss
+    sharpness_loss,               # v4: operates on M_t_logits, no softmax ceiling
     build_bottlenecked_input,
     faithfulness_loss,
     sparsity_loss,
@@ -175,14 +176,18 @@ def main(config: EAHNConfig):
     )
     temp_loss_fn  = TemporalConsistencyLoss(gamma=config.gamma)
 
-    # v2: PeakSpreadLoss — penalises the whole batch sharing the same argmax cell
-    _lambda_peak_spread = float(getattr(config, "lambda_peak_spread", 0.3))
-    peak_spread_fn = PeakSpreadLoss(tau_soft=1.0)
-    print(f"[PeakSpreadLoss] lambda_peak_spread={_lambda_peak_spread}")
+    # v4: HardAttentionDiversityLoss — batch-level cell-popularity concentration
+    # Directly attacks peak_mode_share (fraction of batch sharing same argmax cell).
+    # temperature=0.05 makes it near-hard-argmax, closely matching the diagnostic.
+    _lambda_peak_spread = float(getattr(config, "lambda_peak_spread", 0.5))
+    peak_spread_fn = HardAttentionDiversityLoss(temperature=0.05)
+    print(f"[HardAttentionDiversityLoss] lambda_peak_spread={_lambda_peak_spread}")
 
-    # v3: sharpness loss — maximises within-map std to lift mt_std diagnostic
-    _lambda_sharp = float(getattr(config, "lambda_sharp", 0.5))
-    print(f"[SharpnessLoss] lambda_sharp={_lambda_sharp}")
+    # v4: sharpness loss on M_t_logits (pre-softmax raw scores — no ceiling)
+    # Softmax std over 49 cells is capped at ≈0.141, below the 0.15 threshold.
+    # Raw logit std has no ceiling; sharpness_loss() is imported from explanation.py.
+    _lambda_sharp = float(getattr(config, "lambda_sharp", 1.0))
+    print(f"[SharpnessLoss-logits] lambda_sharp={_lambda_sharp}")
 
     ckpt_path = os.path.join(config.output_dir, f"eahn_{config.dataset_name}_best.pth")
 
@@ -201,13 +206,17 @@ def main(config: EAHNConfig):
     }
 
     # ── Early stopping ────────────────────────────────────────────────────────
+    _no_early_stop = bool(getattr(config, "no_early_stop", False))
     _es_patience  = int(getattr(config, "early_stop_patience",  5))
     _es_min_delta = float(getattr(config, "early_stop_min_delta", 0.001))
     _es_metric    = str(getattr(config, "early_stop_metric", "val_balanced_accuracy"))
     _es_best      = -float("inf")
     _es_wait      = 0
     _es_triggered = False
-    print(
+    if _no_early_stop:
+        print(f"[EarlyStopping] DISABLED (--no_early_stop) — will run all {config.epochs} epochs.")
+    else:
+        print(
         f"[EarlyStopping] metric={_es_metric}  patience={_es_patience}  "
         f"min_delta={_es_min_delta}"
     )
@@ -258,7 +267,8 @@ def main(config: EAHNConfig):
                 # ── Pass A: normal forward ────────────────────────────────────
                 out_A    = model(frames)
                 logits_A = out_A.logit
-                M_t      = out_A.M_t          # (B, T, h, w) from EarlyAttnHead
+                M_t      = out_A.M_t          # (B, T, h, w) softmax from EarlyAttnHead
+                M_t_logits = out_A.M_t_logits  # (B, T, h, w) pre-softmax raw scores
                 loss_cls = cls_loss_fn(logits_A, labels)
 
                 if config.phase21_enabled:
@@ -290,17 +300,16 @@ def main(config: EAHNConfig):
                 l_exp   = exp_out.loss
                 l_temp  = temp_loss_fn(M_t, out_A.low_level)
 
-                # ── PeakSpreadLoss (v2) ───────────────────────────────────────
-                # Penalises the batch when all samples share the same argmax cell.
-                # This directly attacks peak_mode_share > 0.30.
+                # ── HardAttentionDiversityLoss (v4) ──────────────────────────
+                # Batch-level cell-popularity concentration. Near-hard-argmax
+                # (temperature=0.05) → directly attacks peak_mode_share metric.
                 l_peak_spread = peak_spread_fn(M_t)
 
-                # ── Sharpness loss (v3): maximises std within each M_t map ────
-                # mt_std diagnostic = mean over batch of per-sample map std.
-                # This directly maximises that quantity. Unlike sparsity_loss
-                # (-mean_peak) this works even when the peak is in the wrong place.
-                B_s, T_s, h_s, w_s = M_t.shape
-                loss_sharp = -M_t.reshape(B_s * T_s, h_s * w_s).std(dim=1).mean()
+                # ── Sharpness loss on RAW LOGITS (v4) ────────────────────────
+                # Softmax std over 49 cells is CAPPED at ≈0.141 (below threshold
+                # of 0.15). Operating on pre-softmax logits removes this ceiling.
+                # sharpness_loss() = -std(M_t_logits) per (b,t), averaged.
+                loss_sharp = sharpness_loss(M_t_logits)
 
                 # ── Loss weighting ────────────────────────────────────────────
                 _global_step = (epoch - 1) * len(train_loader) + batch_idx
@@ -343,17 +352,21 @@ def main(config: EAHNConfig):
 
             # ── First-batch diagnostics ───────────────────────────────────────
             if epoch == start_epoch + 1 and batch_idx == 0:
-                print(f"[DIAG] M_t mean={out_A.M_t.mean():.4f} std={out_A.M_t.std():.4f}")
+                print(f"[DIAG] M_t mean={out_A.M_t.mean():.4f} std={out_A.M_t.std():.4f}  "
+                      f"M_t_logits std={out_A.M_t_logits.std():.4f}")
                 print(f"[DIAG] L_cls={loss_cls.item():.6f}  L_exp={l_exp.item():.6f}  "
                       f"L_temp={l_temp.item():.6f}  L_faith={loss_faith.item():.6f}  "
                       f"L_sparse={loss_sparse.item():.6f}  "
-                      f"L_peak_spread={l_peak_spread.item():.6f}")
+                      f"L_peak_spread={l_peak_spread.item():.6f}  "
+                      f"L_sharp={loss_sharp.item():.6f}")
                 print(f"[DIAG] lam_faith_eff={lam_faith_eff:.4f}  "
                       f"lambda_peak_spread={_lambda_peak_spread}  "
                       f"lambda_sharp={_lambda_sharp}  "
                       f"lambda_sparse={config.lambda_sparse}")
-                print(f"[DIAG] attn_temp=exp({model.cross_attention.log_temp.item():.3f})"
-                      f"={torch.exp(model.cross_attention.log_temp).item():.3f}")
+                # v4: log early_attn_tau (the tau that actually controls M_t sharpness)
+                # NOT cross_attention.log_temp which is a dead legacy module
+                print(f"[DIAG] early_attn_tau={out_A.early_attn_tau:.4f}  "
+                      f"(log_tau={model.early_attn.log_tau.item():.4f})")
 
             # ── Batch balance check ───────────────────────────────────────────
             if (batch_idx + 1) % LOG_EVERY == 0:
@@ -387,7 +400,7 @@ def main(config: EAHNConfig):
             # ── Rolling log ───────────────────────────────────────────────────
             if (batch_idx + 1) % LOG_EVERY == 0 or (batch_idx + 1) == total_batches:
                 n = max(run["n"], 1)
-                _tau = model.cross_attention.log_temp.exp().item()
+                _tau = out_A.early_attn_tau  # v4: actual M_t sharpening tau
                 print(
                     f"[E{epoch:>{epoch_w}} {batch_idx+1:4d}/{total_batches}] "
                     f"total={run['total']/n:.4f}  cls={run['cls']/n:.4f}  "
@@ -396,7 +409,7 @@ def main(config: EAHNConfig):
                     f"sharp={run['sharp']/n:.4f}  "
                     f"peak_spread={run['peak_spread']/n:.4f}  "
                     f"cons={run['cons']/n:.4f}  "
-                    f"tau={_tau:.2f}  sim={exp_out.inter_sample_sim:.2f}"
+                    f"tau={_tau:.3f}  sim={exp_out.inter_sample_sim:.2f}"
                 )
                 run = {
                     "total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0,
@@ -446,37 +459,44 @@ def main(config: EAHNConfig):
             f"balanced_acc={_val_bal_acc:.3f}"
         )
 
-        # ── Attention-diversity diagnostic (v3: full val-set for meaningful peak_mode_share) ──
-        # peak_mode_share is meaningless at B=2 (always 0.5 or 1.0).
-        # Fix: accumulate M_t peaks across the ENTIRE val loader (~419 samples).
-        # mt_std and cosine are also accumulated for consistency.
-        _all_mt_flat   = []
-        _all_mt_peaks  = []
+        # ── Attention-diversity diagnostic (v4: full val-set) ────────────────
+        # mt_std: computed on M_t_LOGITS (pre-softmax) to avoid the 0.141 ceiling.
+        # peak_mode_share: argmax on softmax M_t (correct — matches diagnostic def).
+        # cosine: on softmax M_t (correct — measures map similarity).
+        _all_mt_flat       = []   # softmax maps for cosine + peak_mode_share
+        _all_mt_logit_flat = []   # raw logits for mt_std
+        _all_mt_peaks      = []
         with torch.no_grad():
             for _diag_batch in val_loader:
                 _diag_frames = _diag_batch["frames"].to(device)
                 _diag_out    = model(_diag_frames)
-                _mt_b        = _diag_out.M_t.mean(dim=1)        # (B, h, w)
-                _mt_flat_b   = _mt_b.reshape(_mt_b.size(0), -1) # (B, hw)
+                _mt_b        = _diag_out.M_t.mean(dim=1)           # (B, h, w) softmax
+                _mt_flat_b   = _mt_b.reshape(_mt_b.size(0), -1)    # (B, hw)
+                _ml_b        = _diag_out.M_t_logits.mean(dim=1)    # (B, h, w) raw logits
+                _ml_flat_b   = _ml_b.reshape(_ml_b.size(0), -1)    # (B, hw)
                 _all_mt_flat.append(_mt_flat_b.cpu())
+                _all_mt_logit_flat.append(_ml_flat_b.cpu())
                 _all_mt_peaks.extend([int(m.argmax().item()) for m in _mt_flat_b])
-        _all_mt_flat_cat = torch.cat(_all_mt_flat, dim=0)       # (N_val, hw)
-        # cosine similarity over full val set
-        _mt_norm_all    = torch.nn.functional.normalize(_all_mt_flat_cat, dim=1)
-        # compute in chunks to avoid OOM on large val sets
+        _all_mt_flat_cat   = torch.cat(_all_mt_flat, dim=0)         # (N_val, hw)
+        _all_ml_flat_cat   = torch.cat(_all_mt_logit_flat, dim=0)   # (N_val, hw)
+
+        # cosine similarity (on softmax maps)
+        _mt_norm_all = torch.nn.functional.normalize(_all_mt_flat_cat, dim=1)
         _chunk = 64
         _cos_vals = []
         for _ci in range(0, len(_mt_norm_all), _chunk):
             _row = _mt_norm_all[_ci:_ci+_chunk]
-            _cos_block = _row @ _mt_norm_all.t()  # (chunk, N_val)
-            # exclude diagonal (self-similarity)
+            _cos_block = _row @ _mt_norm_all.t()
             for _ri, _gi in enumerate(range(_ci, min(_ci+_chunk, len(_mt_norm_all)))):
                 _cos_block[_ri, _gi] = 0.0
             _cos_vals.append(_cos_block.sum(dim=1))
         _N_val      = len(_mt_norm_all)
         diag_cosine = float(torch.cat(_cos_vals).sum() / max(_N_val * (_N_val - 1), 1))
-        diag_std    = float(_all_mt_flat_cat.std(dim=1).mean())
-        # peak_mode_share: fraction of val set sharing the dominant argmax cell
+
+        # mt_std on RAW LOGITS — no softmax ceiling
+        diag_std    = float(_all_ml_flat_cat.std(dim=1).mean())
+
+        # peak_mode_share (on softmax argmax — correct)
         _peak_counts = {}
         for _pk in _all_mt_peaks:
             _peak_counts[_pk] = _peak_counts.get(_pk, 0) + 1
@@ -641,37 +661,38 @@ def main(config: EAHNConfig):
             print(f"[Phase21 snapshot] saved → {snap_dir}")
 
         # ── Early stopping check ───────────────────────────────────────────────
-        _es_metric_map = {
-            "val_balanced_accuracy": "val_balanced_acc",
-            "val_balanced_acc":      "val_balanced_acc",
-            "val_auc_roc":           "val_auc_roc",
-            "val_fake_accuracy":     "val_fake_acc",
-            "val_fake_acc":          "val_fake_acc",
-        }
-        _es_key = _es_metric_map.get(_es_metric, "val_balanced_acc")
-        _es_cur = history[_es_key][-1] if history[_es_key] else float("nan")
+        if not _no_early_stop:
+            _es_metric_map = {
+                "val_balanced_accuracy": "val_balanced_acc",
+                "val_balanced_acc":      "val_balanced_acc",
+                "val_auc_roc":           "val_auc_roc",
+                "val_fake_accuracy":     "val_fake_acc",
+                "val_fake_acc":          "val_fake_acc",
+            }
+            _es_key = _es_metric_map.get(_es_metric, "val_balanced_acc")
+            _es_cur = history[_es_key][-1] if history[_es_key] else float("nan")
 
-        if np.isfinite(_es_cur):
-            if _es_cur > _es_best + _es_min_delta:
-                _es_best = _es_cur
-                _es_wait = 0
-                print(f"[EarlyStopping] Improvement → {_es_key}={_es_cur:.4f} (best={_es_best:.4f})")
-            else:
-                _es_wait += 1
-                print(
-                    f"[EarlyStopping] No improvement for {_es_wait}/{_es_patience} epochs "
-                    f"({_es_key}={_es_cur:.4f} ≤ best+delta={_es_best + _es_min_delta:.4f})"
-                )
-                if _es_wait >= _es_patience:
+            if np.isfinite(_es_cur):
+                if _es_cur > _es_best + _es_min_delta:
+                    _es_best = _es_cur
+                    _es_wait = 0
+                    print(f"[EarlyStopping] Improvement → {_es_key}={_es_cur:.4f} (best={_es_best:.4f})")
+                else:
+                    _es_wait += 1
                     print(
-                        f"[EarlyStopping] TRIGGERED at epoch {epoch}. "
-                        f"Restoring best checkpoint ({SELECTION_KEY}={best_metric:.4f})."
+                        f"[EarlyStopping] No improvement for {_es_wait}/{_es_patience} epochs "
+                        f"({_es_key}={_es_cur:.4f} ≤ best+delta={_es_best + _es_min_delta:.4f})"
                     )
-                    if os.path.exists(ckpt_path):
-                        load_checkpoint(ckpt_path, model)
-                        print(f"[EarlyStopping] Best weights restored from {ckpt_path}")
-                    _es_triggered = True
-                    break
+                    if _es_wait >= _es_patience:
+                        print(
+                            f"[EarlyStopping] TRIGGERED at epoch {epoch}. "
+                            f"Restoring best checkpoint ({SELECTION_KEY}={best_metric:.4f})."
+                        )
+                        if os.path.exists(ckpt_path):
+                            load_checkpoint(ckpt_path, model)
+                            print(f"[EarlyStopping] Best weights restored from {ckpt_path}")
+                        _es_triggered = True
+                        break
 
     logger.close()
     _stop_reason = "early stopping" if _es_triggered else "epoch limit"

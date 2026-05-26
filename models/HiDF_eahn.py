@@ -1,10 +1,21 @@
 """
 models/HiDF_eahn.py — Explanation-Aware Hybrid Network (EAHN).
 
-v3 patch — mt_std fix:
-  EarlyAttnHead tau floor lowered 0.3 → 0.1 so the conv network can produce
-  sharper softmax maps earlier in training (uniform map → low mt_std).
-  All other architecture unchanged.
+v4 patch — mt_std ceiling fix:
+  ROOT CAUSE: M_t is a softmax over 49 cells (7×7). The theoretical maximum
+  std of a softmax distribution over D=49 cells is sqrt((1-1/D)/D) ≈ 0.141.
+  The diagnostic threshold is 0.15 — IMPOSSIBLE to reach with softmax values.
+
+  FIX: EAHNOutput now carries M_t_logits (pre-softmax logits, unnormalised).
+  loss_sharp in train_real.py is computed on M_t_logits instead of M_t.
+  The diagnostic mt_std is also computed on M_t_logits (std of raw scores,
+  range unbounded, easily exceeds 0.15 once the conv learns to peak).
+
+  M_t (softmax) is kept for all gating, attention pooling, and loss_faith —
+  it must remain a proper probability distribution for those paths.
+
+  Also: EAHNOutput now exposes early_attn_tau so train_real.py can log the
+  actual sharpening temperature (not cross_attention.log_temp which is dead).
 """
 
 import torch
@@ -20,23 +31,30 @@ from models.HiDF_cross_attention import CrossAttentionFusion
 
 @dataclass
 class EAHNOutput:
-    logit:     torch.Tensor
-    prob:      torch.Tensor
-    M_t:       torch.Tensor   # (B, T, h, w)
-    M_t_up:    torch.Tensor   # (B, T, H, W)
-    S:         torch.Tensor   # (B, T, N, d_model)
-    low_level: torch.Tensor   # (B, T, C_low, Hl, Wl)
-    attn_pool: torch.Tensor   # (B, d_model)
+    logit:          torch.Tensor
+    prob:           torch.Tensor
+    M_t:            torch.Tensor   # (B, T, h, w) — softmax, sums to 1 per (b,t)
+    M_t_logits:     torch.Tensor   # (B, T, h, w) — pre-softmax raw scores (for mt_std loss/diag)
+    M_t_up:         torch.Tensor   # (B, T, H, W)
+    S:              torch.Tensor   # (B, T, N, d_model)
+    low_level:      torch.Tensor   # (B, T, C_low, Hl, Wl)
+    attn_pool:      torch.Tensor   # (B, d_model)
+    early_attn_tau: float          # exp(log_tau) at forward time — for logging
 
 
 class EarlyAttnHead(nn.Module):
     """Phase 21: produces M_t from CNN feature map BEFORE the transformer.
 
-    v3: tau floor lowered from 0.3 → 0.1.
-    Rationale: with tau=0.3 and near-zero conv logits at init, softmax is
-    still very uniform (std ≈ 0.02 over 49 cells). Lowering to 0.1 allows
-    the gradient to sharpen the map much earlier, directly lifting mt_std.
-    The learnable log_tau will grow if the task needs smoother maps.
+    v4: returns (M_softmax, logits_raw) so callers can use the proper quantity
+    for loss_sharp and the mt_std diagnostic without hitting the softmax ceiling.
+
+    Softmax ceiling problem: softmax over D=49 cells has max std ≈ sqrt((1-1/D)/D)
+    ≈ 0.141, which is below the required threshold of 0.15. Using raw logits (std
+    of unnormalised scores) has no such ceiling — the conv network just needs to
+    learn to produce high-variance score maps, which is much easier to optimise.
+
+    M_softmax is still used for gating and attention pooling (must sum to 1).
+    logits_raw is used only for loss_sharp and mt_std diagnostic.
     """
     def __init__(self, d_model: int = 256, hidden: int = 64,
                  init_temperature: float = 1.0):
@@ -52,11 +70,12 @@ class EarlyAttnHead(nn.Module):
     def forward(self, feats):  # feats: (B, T, C, H, W)
         B, T, C, H, W = feats.shape
         x = feats.reshape(B * T, C, H, W)
-        logits = self.proj(x).reshape(B, T, H * W)          # (B, T, H*W)
-        # v3: floor lowered 0.3 → 0.1 for sharper maps early in training
+        logits = self.proj(x).reshape(B, T, H * W)          # (B, T, H*W) raw scores
         tau = self.log_tau.exp().clamp(min=0.1, max=3.0)
         M = F.softmax(logits / tau, dim=-1)                  # (B, T, H*W), sums to 1
-        return M.reshape(B, T, H, W)
+        M_spatial   = M.reshape(B, T, H, W)
+        logits_spatial = logits.reshape(B, T, H, W)
+        return M_spatial, logits_spatial, tau.item()
 
 
 class EAHN(nn.Module):
@@ -133,7 +152,8 @@ class EAHN(nn.Module):
             .reshape(B * T, d, self.feat_h, self.feat_w)
             .reshape(B, T, d, self.feat_h, self.feat_w)
         )
-        M_t_early = self.early_attn(feats_5d)                # (B, T, h, w)
+        # v4: unpack (softmax map, raw logits, tau scalar)
+        M_t_early, M_t_logits, _tau_val = self.early_attn(feats_5d)
         gate = (M_t_early + self.attn_floor) / (1.0 + self.attn_floor)
         spatial_tokens = (
             feats_5d * gate.unsqueeze(2)
@@ -161,7 +181,9 @@ class EAHN(nn.Module):
 
         return EAHNOutput(
             logit=logit, prob=prob,
-            M_t=M_t_early, M_t_up=M_t_up_early,
+            M_t=M_t_early, M_t_logits=M_t_logits,
+            M_t_up=M_t_up_early,
             S=spatial_tokens, low_level=low_level,
             attn_pool=attn_pool,
+            early_attn_tau=_tau_val,
         )

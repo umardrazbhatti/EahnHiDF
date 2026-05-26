@@ -49,8 +49,8 @@ class EAHNConfig:
 
     # ── Classification loss ───────────────────────────────────────────────────
     cls_loss_type: str = "focal"   # "bce" | "focal" — phase 19.8: activate focal to up-weight hard fakes
-    focal_alpha: float = 0.65   # phase 19.8: up-weights fake class; >0.5 biases toward fake recall
-    focal_gamma: float = 2.0   # phase 19.8: standard focal exponent; focuses on hard examples
+    focal_alpha: float = 0.75   # v4: raised 0.65→0.75 to penalise fake misses harder (fixes fake_acc collapse)
+    focal_gamma: float = 2.5   # v4: raised 2.0→2.5 for stronger hard-example focus
 
     # ── Training ──────────────────────────────────────────────────────────────
     epochs: int = 50
@@ -85,6 +85,7 @@ class EAHNConfig:
     early_stop_patience:  int   = 5                         # epochs without improvement before halt
     early_stop_metric:    str   = "val_balanced_accuracy"   # metric to monitor
     early_stop_min_delta: float = 0.001                     # minimum improvement to count
+    no_early_stop:        bool  = False                     # v4: set True to disable ES entirely (run full epochs)
 
     # ── Phase 21: faithful attention bottleneck ───────────────────────────────
     phase21_enabled:      bool  = True    # master switch; False reverts to Phase 20 behaviour
@@ -93,6 +94,9 @@ class EAHNConfig:
     faith_warmup_epochs:  int   = 3       # linear ramp from 0 → lambda_faith over N epochs
     attn_floor:           float = 0.05    # gate floor in EarlyAttnHead
     blur_kernel:          int   = 21      # Gaussian kernel size for bottlenecked input
+    lambda_peak_spread:   float = 0.5     # v4: raised 0.3→0.5; weight for HardAttentionDiversityLoss
+    lambda_sharp:         float = 1.0     # v4: raised 0.5→1.0; weight for sharpness loss on logits
+    disk_guard_gb:        float = 3.0     # v4: min free GB before face-cache write is skipped
     blur_sigma:           float = 10.0    # Gaussian sigma for bottlenecked input
     snapshot_every:       int   = 2       # save snapshot every N epochs
 
@@ -235,4 +239,13 @@ def parse_args() -> argparse.Namespace:
                         help="Gaussian sigma for bottlenecked input (default 10.0).")
     parser.add_argument("--snapshot_every", type=int, default=None,
                         help="Save Phase 21 snapshot every N epochs (default 2).")
+    parser.add_argument("--no_early_stop", dest="no_early_stop",
+                        action="store_true", default=None,
+                        help="Disable early stopping — run all epochs regardless of metric plateau.")
+    parser.add_argument("--lambda_peak_spread", type=float, default=None,
+                        help="Weight for HardAttentionDiversityLoss (default 0.5).")
+    parser.add_argument("--lambda_sharp", type=float, default=None,
+                        help="Weight for sharpness loss on M_t_logits (default 1.0).")
+    parser.add_argument("--disk_guard_gb", type=float, default=None,
+                        help="Min free disk GB before face-cache write is skipped (default 3.0).")
     return parser.parse_args()
