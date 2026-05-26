@@ -95,7 +95,7 @@ class EAHNConfig:
     attn_floor:           float = 0.05    # gate floor in EarlyAttnHead
     blur_kernel:          int   = 21      # Gaussian kernel size for bottlenecked input
     lambda_peak_spread:   float = 0.5     # v4: raised 0.3→0.5; weight for HardAttentionDiversityLoss
-    lambda_sharp:         float = 1.0     # v4: raised 0.5→1.0; weight for sharpness loss on logits
+    lambda_sharp:         float = 0.15     # v4: raised 0.5→1.0; weight for sharpness loss on logits
     disk_guard_gb:        float = 3.0     # v4: min free GB before face-cache write is skipped
     blur_sigma:           float = 10.0    # Gaussian sigma for bottlenecked input
     snapshot_every:       int   = 2       # save snapshot every N epochs

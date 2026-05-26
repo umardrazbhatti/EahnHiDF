@@ -160,20 +160,30 @@ class HardAttentionDiversityLoss(nn.Module):
 # ── Sharpness loss on raw logits (fixes mt_std ceiling) ──────────────────────
 
 def sharpness_loss(M_t_logits: torch.Tensor) -> torch.Tensor:
-    """Negative std of raw pre-softmax logits.
+    """Sharpness loss on pre-softmax logits — bounded to [-1, 0].
 
-    Operates on M_t_logits (NOT softmax M_t). Softmax values over 49 cells
-    have a hard std ceiling of ≈0.141 — below the 0.15 threshold. Raw logits
-    have no ceiling; the conv just needs to produce high-variance score maps.
+    WHY LOGITS NOT SOFTMAX:
+      Softmax over 49 cells has a hard std ceiling of ≈0.141, below the 0.15
+      threshold. Raw logits have no ceiling so they can signal real sharpness.
 
-    Minimising this loss (i.e. maximising std) pushes the conv to produce
-    peaked score maps, which after softmax yield sharper attention.
+    WHY BOUNDED:
+      Raw logit std grows without limit as the conv learns (observed: 0.85 at
+      init, growing to 2000+ by E2 causing fp16 overflow → NaN). We use tanh
+      to squash std into [0,1] then negate, giving loss in [-1, 0].
+      - Uniform map  → std ≈ 0 → tanh(0) = 0   → loss = 0  (worst)
+      - Sharp map    → std → ∞ → tanh(∞) = 1   → loss = -1 (best)
+      This makes lambda_sharp=0.15 safe regardless of logit scale.
 
     M_t_logits : (B, T, h, w) — raw scores from EarlyAttnHead before softmax.
     """
     B, T, h, w = M_t_logits.shape
     flat = M_t_logits.reshape(B * T, h * w)
-    return -flat.std(dim=1).mean()
+    # centre per-map so std isn't affected by mean offset
+    flat = flat - flat.mean(dim=1, keepdim=True)
+    std_per_map = flat.std(dim=1)          # (B*T,), unbounded positive
+    # squash to [0,1] with tanh, scale so typical init std≈0.85 → tanh(0.85)≈0.69
+    sharpness = torch.tanh(std_per_map)    # (B*T,), in [0, 1)
+    return -sharpness.mean()               # in [-1, 0]; minimise → maximise sharpness
 
 
 # ── Phase 21 utilities ────────────────────────────────────────────────────────

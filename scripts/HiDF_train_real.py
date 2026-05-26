@@ -183,10 +183,9 @@ def main(config: EAHNConfig):
     peak_spread_fn = HardAttentionDiversityLoss(temperature=0.05)
     print(f"[HardAttentionDiversityLoss] lambda_peak_spread={_lambda_peak_spread}")
 
-    # v4: sharpness loss on M_t_logits (pre-softmax raw scores — no ceiling)
-    # Softmax std over 49 cells is capped at ≈0.141, below the 0.15 threshold.
-    # Raw logit std has no ceiling; sharpness_loss() is imported from explanation.py.
-    _lambda_sharp = float(getattr(config, "lambda_sharp", 1.0))
+    # v4: sharpness loss on M_t_logits (pre-softmax). Output is tanh-bounded
+    # in [-1,0] so lambda_sharp=0.15 keeps it safely below cls magnitude.
+    _lambda_sharp = float(getattr(config, "lambda_sharp", 0.15))
     print(f"[SharpnessLoss-logits] lambda_sharp={_lambda_sharp}")
 
     ckpt_path = os.path.join(config.output_dir, f"eahn_{config.dataset_name}_best.pth")
@@ -338,6 +337,19 @@ def main(config: EAHNConfig):
                     l_total = l_total + _lambda_cons * l_consistency
                 else:
                     l_consistency = torch.tensor(0.0)
+
+                # ── NaN guard — skip step if any loss term is non-finite ──────
+                if not torch.isfinite(l_total):
+                    print(
+                        f"[NaNGuard] Non-finite loss at epoch={epoch} "
+                        f"batch={batch_idx}: total={l_total.item():.4f}  "
+                        f"cls={loss_cls.item():.4f}  "
+                        f"sharp={loss_sharp.item():.4f}  "
+                        f"peak={l_peak_spread.item():.4f}  "
+                        f"— skipping backward for this step."
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
 
                 loss = l_total / config.grad_accum_steps
 
